@@ -14,6 +14,8 @@ letting it run commands in the sandbox to prove or disprove its own claims.
 
 ![Audit chat](docs/screenshot-chat.png)
 
+![AI coverage panel — honest when the model never answered](docs/screenshot-coverage.png)
+
 ---
 
 ## What it actually does
@@ -138,7 +140,8 @@ app/
   static/       index.html · chat.html · css/ · js/         the UI
   main.py       HTTP + WebSocket surface
   pipeline.py   download → index → audit → report
-tests/          46 tests, including a deliberately-broken fixture site
+tests/          51 tests, including a deliberately-broken fixture site and a
+                real-Ollama integration test that skips without one
 ```
 
 ---
@@ -146,7 +149,7 @@ tests/          46 tests, including a deliberately-broken fixture site
 ## Tests
 
 ```bash
-pytest                       # 46 tests, ~7 seconds
+pytest                       # 51 tests, ~10 seconds
 ```
 
 `tests/fixtures/site/` is a small website with real planted bugs — a leaked
@@ -161,6 +164,34 @@ unavailable. To run them against a different image:
 ```bash
 VUNRABLITY_TEST_IMAGE=my-image:tag pytest tests/test_sandbox.py
 ```
+
+### Proving the model is the one finding things
+
+Every test above except one replaces Ollama with a scripted stand-in — that
+proves the *plumbing* works, not that a real model reads real code. To prove
+that, point `tests/test_llm_integration.py` at a live Ollama:
+
+```bash
+ollama pull qwen2.5-coder:7b     # or set OLLAMA_MODEL to whatever you have
+pytest tests/test_llm_integration.py -v -s
+```
+
+It skips automatically if Ollama isn't reachable. When it runs, it asserts —
+against the *real* model's *real* output — that: the model actually answered
+(not just that it was asked), at least one finding is attributed to it
+(`source: "ai"`, never producible by the rule engine), the finding touches one
+of the fixture's planted bugs by content rather than by coincidence, and every
+AI-cited line number exists in the real file on disk.
+
+The same guarantee holds at runtime, not just in tests. `Analyzer` only
+credits a file as AI-reviewed once the model has returned a chunk it could
+actually parse — being *sent* to the model doesn't count, only a real answer
+does (see `files_ai_reviewed` in `app/analysis/analyzer.py`). Every finding
+carries its `source` (`ai`, `rule:<id>`, `header-check`, `exposure-probe`,
+`form-check`, or `agent`), so nothing the rule engine found can be mistaken
+for something the model found. The chat UI's "AI coverage" panel renders this
+directly: how many files were queued, how many the model actually answered
+for, and how the findings split by origin.
 
 ---
 

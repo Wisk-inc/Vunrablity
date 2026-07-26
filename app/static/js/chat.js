@@ -57,8 +57,58 @@ async function loadScan() {
     $("verdictText").textContent = summary.verdict || summary.summary || "";
   }
 
+  renderCoverage(summary.coverage);
   renderCounts(data.counts || {});
   renderFindings();
+}
+
+/* Makes the model's actual involvement checkable, not just claimed: how many
+   files it was sent, how many it returned a real answer for, and how many of
+   the findings on the left came from the model versus the pattern rules. */
+function renderCoverage(cov) {
+  const box = $("coverageBox");
+  if (!cov) { box.hidden = true; return; }
+  box.hidden = false;
+
+  const denom = Math.max(1, cov.files_queued_for_ai || 0);
+  const pct = Math.round(100 * (cov.files_ai_reviewed || 0) / denom);
+
+  $("coverageTitle").textContent = cov.ai_available
+    ? `${cov.ai_model} read ${cov.files_ai_reviewed}/${cov.files_queued_for_ai} queued files`
+    : `AI unreachable — rule engine only`;
+
+  const bar = $("coverageFill");
+  bar.style.width = `${cov.ai_available ? pct : 0}%`;
+  $("coverageFill").parentElement.classList.toggle("degraded", !cov.ai_available);
+
+  const rows = $("coverageRows");
+  rows.innerHTML = "";
+  const add = (label, value) => {
+    const row = document.createElement("div");
+    row.className = "coverage-row";
+    row.innerHTML = `<span>${label}</span><b></b>`;
+    row.querySelector("b").textContent = value;
+    rows.appendChild(row);
+  };
+  add("Chunks sent to the model", `${cov.chunks_sent_to_ai} sent · ${cov.chunks_ai_answered} answered`);
+  add("Findings from the AI's reading", cov.findings_from_ai);
+  add("Findings from pattern rules", cov.findings_from_rules);
+  add("Findings from headers / exposed paths", cov.findings_from_headers_and_probes);
+  if (cov.files_vendor_skipped) {
+    add("Vendored/minified files skipped", cov.files_vendor_skipped);
+  }
+
+  const rows2 = $("coverageRows");
+  const existingWarn = rows2.parentElement.querySelector(".coverage-warn");
+  existingWarn?.remove();
+  if (!cov.ai_available) {
+    const warn = document.createElement("div");
+    warn.className = "coverage-warn";
+    warn.textContent = "The model never answered during this scan. Every finding " +
+      "above came from the deterministic rule engine and header checks — start " +
+      "Ollama and re-scan for a line-by-line review.";
+    rows2.parentElement.appendChild(warn);
+  }
 }
 
 function renderCounts(counts) {
@@ -71,6 +121,31 @@ function renderCounts(counts) {
     el.onclick = () => { filter = filter === s ? null : s; renderCounts(counts); renderFindings(); };
     box.appendChild(el);
   });
+}
+
+/* Maps a finding's raw `source` field to a badge that says plainly whether the
+   model found this, or a deterministic check did — the two are never blended
+   into one label, so the origin of every claim on screen stays checkable. */
+function sourceOrigin(source) {
+  if (source === "ai") {
+    return { kind: "ai", label: "AI read this", title: "Found by the model while reading this file line by line" };
+  }
+  if (source === "agent") {
+    return { kind: "ai", label: "AI · sandbox-confirmed", title: "Found by the agent while executing code in the sandbox" };
+  }
+  if (source?.startsWith("rule:")) {
+    return { kind: "rule", label: "Pattern rule", title: `Deterministic rule: ${source.slice(5)}` };
+  }
+  if (source === "header-check") {
+    return { kind: "rule", label: "Response headers", title: "Deterministic check of the server's HTTP headers" };
+  }
+  if (source === "exposure-probe") {
+    return { kind: "rule", label: "Exposed path", title: "A well-known path answered with real content" };
+  }
+  if (source === "form-check") {
+    return { kind: "rule", label: "Form check", title: "Deterministic check of a form's markup" };
+  }
+  return { kind: "rule", label: source || "check", title: source || "" };
 }
 
 function renderFindings() {
@@ -88,10 +163,12 @@ function renderFindings() {
   list.forEach((f) => {
     const el = document.createElement("article");
     el.className = "finding";
+    const origin = sourceOrigin(f.source);
     el.innerHTML = `
       <div class="top">
         <span class="sev sev-${f.severity}">${LABEL[f.severity] || f.severity}</span>
-        <span class="tiny dim">${Math.round((f.confidence || 0) * 100)}%</span>
+        <span class="origin origin-${origin.kind}" title="${origin.title}">${origin.label}</span>
+        <span class="tiny dim" style="margin-left:auto">${Math.round((f.confidence || 0) * 100)}%</span>
       </div>
       <h4></h4>
       <div class="loc"></div>
@@ -109,7 +186,7 @@ function renderFindings() {
     el.querySelector("h4").textContent = f.title;
     el.querySelector(".loc").textContent =
       `${f.file_path || "—"}${f.line_start ? ":" + f.line_start : ""}` +
-      `${f.cwe ? "  ·  " + f.cwe : ""}  ·  ${f.source || ""}`;
+      `${f.cwe ? "  ·  " + f.cwe : ""}`;
     el.querySelector(".why").textContent = f.explanation || "—";
     el.querySelector(".ev").textContent = f.evidence || "—";
     el.querySelector(".fx").textContent = f.fix || "—";

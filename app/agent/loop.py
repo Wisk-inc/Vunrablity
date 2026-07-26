@@ -41,6 +41,7 @@ class Investigator:
         self.on_event = on_event
         self.max_steps = max_steps or settings.agent_max_steps
         self.transcript: list[dict] = []
+        self._json_mode_supported = True
 
     async def run(self) -> dict:
         scan = db.get_scan(self.scan_id) or {}
@@ -54,7 +55,7 @@ class Investigator:
 
         for step in range(1, self.max_steps + 1):
             try:
-                raw = await self.llm.chat(history, temperature=0.15)
+                raw = await self._chat_for_action(history)
             except OllamaUnavailable as exc:
                 await self._event("agent_error", {"error": str(exc)})
                 return {"answer": f"The model is unreachable: {exc}", "steps": step - 1,
@@ -101,6 +102,22 @@ class Investigator:
         await self._event("agent_done", {"answer": summary, "steps": self.max_steps})
         return {"answer": summary, "steps": self.max_steps,
                 "transcript": self.transcript, "findings": self.tools.new_findings}
+
+    async def _chat_for_action(self, history: list[dict]) -> str:
+        """One turn's worth of chat, constrained to JSON when the server allows it.
+
+        Every turn is supposed to be exactly one JSON action — grammar-
+        constrained decoding is what makes that reliable instead of hoped-for.
+        If this server/model rejects the `format` field outright, fall back to
+        plain decoding for the rest of the run rather than treating a feature
+        gap as "the model is unreachable".
+        """
+        if self._json_mode_supported:
+            try:
+                return await self.llm.chat(history, temperature=0.15, json_mode=True)
+            except OllamaUnavailable:
+                self._json_mode_supported = False
+        return await self.llm.chat(history, temperature=0.15, json_mode=False)
 
     async def _forced_answer(self, history: list[dict]) -> str:
         history = history + [{"role": "user", "content":

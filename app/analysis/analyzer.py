@@ -73,6 +73,18 @@ class Analyzer:
         self.llm_available = True
         self.llm_error: str | None = None
 
+        # Coverage accounting: proof of how much of the reading was actually
+        # done by the model, as opposed to the deterministic rule pass. A file
+        # only enters `files_ai_reviewed` once the model has returned at least
+        # one successfully parsed chunk for it — being *sent* to the model is
+        # not enough to count as "read".
+        self.files_considered = 0
+        self.files_vendor_skipped: list[str] = []
+        self.files_queued = 0
+        self.files_ai_reviewed: set[str] = set()
+        self.chunks_sent = 0
+        self.chunks_answered = 0
+
     # ------------------------------------------------------------------ run
     async def run(self) -> dict:
         await self._emit("analyzing", 0.46, "Opening the mirror")
@@ -86,19 +98,24 @@ class Analyzer:
         )
 
         queue = self._reading_queue()
+        self.files_queued = len(queue)
         await self._emit("analyzing", 0.52,
                          f"{len(queue)} files queued for line-by-line review")
 
         total = max(1, len(queue))
         for idx, item in enumerate(queue):
-            await self._read_file(item)
+            stats = await self._read_file(item)
+            # A file only counts as AI-reviewed once the model actually
+            # returned a parsed chunk for it — not merely because it was sent.
+            if stats["chunks_ok"] > 0:
+                self.files_ai_reviewed.add(item["path"])
+                db.mark_analyzed(self.scan_id, item["path"])
             pct = 0.52 + 0.42 * ((idx + 1) / total)
             await self._emit(
                 "analyzing", pct,
                 f"Read {idx + 1}/{total} · {item['path']} "
                 f"({len(self.findings)} findings so far)",
             )
-            db.mark_analyzed(self.scan_id, item["path"])
 
         report = await self._write_report()
         await self._emit("done", 1.0, "Audit complete")
@@ -179,6 +196,8 @@ class Analyzer:
             if not text.strip():
                 continue
 
+            self.files_considered += 1
+
             lines = text.count("\n") + 1
             minified = len(text) / max(1, lines) > MINIFIED_RATIO
             vendor = any(v in path.lower() for v in VENDOR_HINTS)
@@ -190,6 +209,7 @@ class Analyzer:
             if (minified or vendor) and score < 6.0:
                 for hit in hits:
                     self._record(static_rules.hit_to_finding(hit, path))
+                self.files_vendor_skipped.append(path)
                 continue
 
             rank = (
@@ -212,7 +232,14 @@ class Analyzer:
         return [item for _, item in scored[: settings.analysis_max_files]]
 
     # ------------------------------------------------------------------ per file
-    async def _read_file(self, item: dict) -> None:
+    async def _read_file(self, item: dict) -> dict:
+        """Send every line of `item` to the model, one window at a time.
+
+        Returns `{"chunks_sent": N, "chunks_ok": M}` so the caller can tell
+        whether the model actually engaged with this file — a file whose
+        every chunk failed to parse, or that was never sent because the model
+        was down, must not be reported as AI-reviewed.
+        """
         path, text = item["path"], item["text"]
         lines = text.splitlines() or [""]
         chunk_size = settings.analysis_chunk_lines
@@ -224,8 +251,10 @@ class Analyzer:
         for hit in item["hits"]:
             self._record(static_rules.hit_to_finding(hit, path))
 
+        stats = {"chunks_sent": 0, "chunks_ok": 0}
+
         if not self.llm_available:
-            return
+            return stats
 
         chunk_notes: list[str] = []
         file_findings: list[dict] = []
@@ -253,6 +282,8 @@ class Analyzer:
                 code=listing,
             )
 
+            stats["chunks_sent"] += 1
+            self.chunks_sent += 1
             try:
                 result = await self.llm.json_chat([
                     {"role": "system", "content": prompts.AUDITOR_SYSTEM},
@@ -263,12 +294,17 @@ class Analyzer:
                 self.llm_error = str(exc)
                 await self._emit("analyzing", 0.6,
                                  f"Model unavailable — rules only. {exc}")
-                return
+                return stats
             except ValueError:
                 continue  # unparseable reply for this window; keep going
 
             if not isinstance(result, dict):
                 continue
+
+            # A response the model actually produced and we could parse —
+            # this is the concrete evidence that it read this stretch of code.
+            stats["chunks_ok"] += 1
+            self.chunks_answered += 1
 
             if summary := str(result.get("summary") or "").strip():
                 chunk_notes.append(f"lines {first}-{last}: {summary}")
@@ -287,7 +323,9 @@ class Analyzer:
             if last >= len(lines):
                 break
 
-        await self._summarize_file(path, len(lines), chunk_notes, file_findings)
+        if stats["chunks_ok"] > 0:
+            await self._summarize_file(path, len(lines), chunk_notes, file_findings)
+        return stats
 
     async def _summarize_file(self, path: str, line_count: int,
                               notes: list[str], found: list[dict]) -> None:
@@ -324,6 +362,29 @@ class Analyzer:
 
         top = sorted(self.findings, key=lambda f: (sev.rank(f["severity"]),
                                                    -float(f.get("confidence", 0))))[:25]
+
+        ai_findings = sum(1 for f in self.findings if f.get("source") == "ai")
+        rule_findings = sum(1 for f in self.findings
+                            if str(f.get("source", "")).startswith("rule:"))
+
+        # Proof of work: how much of the mirror the model actually engaged
+        # with, as opposed to what the deterministic rules alone produced.
+        # `files_ai_reviewed` only counts a file once the model returned at
+        # least one chunk it could parse — see Analyzer._read_file.
+        coverage = {
+            "ai_model": self.llm.model,
+            "ai_available": self.llm_available,
+            "files_total": self.files_considered,
+            "files_vendor_skipped": len(self.files_vendor_skipped),
+            "files_queued_for_ai": self.files_queued,
+            "files_ai_reviewed": len(self.files_ai_reviewed),
+            "chunks_sent_to_ai": self.chunks_sent,
+            "chunks_ai_answered": self.chunks_answered,
+            "findings_from_ai": ai_findings,
+            "findings_from_rules": rule_findings,
+            "findings_from_headers_and_probes": len(self.findings) - ai_findings - rule_findings,
+        }
+
         base = {
             "url": self.crawl.get("root_url"),
             "counts": counts,
@@ -333,6 +394,7 @@ class Analyzer:
             "risk": sev.worst([f["severity"] for f in self.findings]) if self.findings else "info",
             "generated_at": time.time(),
             "llm_error": self.llm_error,
+            "coverage": coverage,
         }
 
         if not self.llm_available:

@@ -138,6 +138,76 @@ def test_model_json_is_recovered_from_messy_replies():
     assert extract_json("not json at all") is None
 
 
+def test_json_extraction_survives_realistic_local_model_quirks():
+    # a chain-of-thought preamble with no fence at all
+    chatty = (
+        "Looking at this code carefully, line by line:\n\n"
+        "The function concatenates user input directly into a SQL string, "
+        "which is a classic injection point.\n\n"
+        '{"summary": "SQL built from request params", "findings": '
+        '[{"title": "SQL injection", "severity": "critical"}]}\n\n'
+        "Let me know if you would like more detail on the fix."
+    )
+    parsed = extract_json(chatty)
+    assert parsed["findings"][0]["title"] == "SQL injection"
+
+    # a coder model drifting into Python literals instead of JSON ones
+    pythonic = '{"findings": [], "vulnerable": False, "reviewed": True, "note": None}'
+    assert extract_json(pythonic) == {
+        "findings": [], "vulnerable": False, "reviewed": True, "note": None,
+    }
+
+    # fence with trailing commentary after the closing ```
+    fenced_then_chatty = (
+        '```json\n{"summary": "looks fine", "findings": []}\n```\n\n'
+        "That covers this chunk — nothing else stood out."
+    )
+    assert extract_json(fenced_then_chatty) == {"summary": "looks fine", "findings": []}
+
+
+@pytest.mark.asyncio
+async def test_json_chat_asks_ollama_to_constrain_output_to_json():
+    """format:"json" (grammar-constrained decoding) is what makes the model's
+    findings reliably parseable — this must be requested, not left implicit."""
+    from app.analysis.llm import Ollama
+
+    seen_json_mode = []
+
+    class Stub:
+        model = "stub-model"
+
+        async def chat(self, messages, *, temperature=0.05, json_mode=False, **kw):
+            seen_json_mode.append(json_mode)
+            return json.dumps({"ok": True})
+
+    result = await Ollama.json_chat(Stub(), [{"role": "user", "content": "x"}])
+    assert result == {"ok": True}
+    assert seen_json_mode == [True]
+
+
+@pytest.mark.asyncio
+async def test_json_chat_falls_back_when_the_server_rejects_json_mode():
+    """Older Ollama builds, or models without grammar support, may reject the
+    format constraint outright — that must degrade gracefully, not lose the
+    model's answer entirely."""
+    from app.analysis.llm import Ollama, OllamaUnavailable
+
+    calls = []
+
+    class Stub:
+        model = "stub-model"
+
+        async def chat(self, messages, *, temperature=0.05, json_mode=False, **kw):
+            calls.append(json_mode)
+            if json_mode:
+                raise OllamaUnavailable("400 Bad Request: unknown field 'format'")
+            return json.dumps({"recovered": True})
+
+    result = await Ollama.json_chat(Stub(), [{"role": "user", "content": "x"}])
+    assert result == {"recovered": True}
+    assert calls == [True, False]
+
+
 # --------------------------------------------------------------------------- pipeline
 class ScriptedLLM:
     """Stands in for Ollama: reports one finding on any chunk containing eval()."""
@@ -230,6 +300,26 @@ async def test_full_audit_finds_real_problems(site_server, scan_dir, monkeypatch
     assert report["total"] == len(findings)
     assert llm.calls > 0
 
+    # coverage proves the model, not just the rules, did the reading
+    cov = report["coverage"]
+    assert cov["ai_available"] is True
+    assert cov["ai_model"] == "scripted"
+    assert cov["chunks_sent_to_ai"] > 0
+    assert cov["chunks_ai_answered"] == cov["chunks_sent_to_ai"]  # scripted LLM never fails
+    assert cov["files_ai_reviewed"] > 0
+    assert cov["files_ai_reviewed"] <= cov["files_queued_for_ai"]
+    assert cov["findings_from_ai"] == len(ai)
+    assert cov["findings_from_ai"] + cov["findings_from_rules"] \
+        + cov["findings_from_headers_and_probes"] == cov["findings_from_ai"] + len(
+            [f for f in findings if f["source"] != "ai"])
+
+    # every file the model actually answered for is marked analyzed in the DB
+    files = {r["path"]: r["analyzed"] for r in db.list_files(scan_id)}
+    ai_touched_paths = {f["file_path"] for f in ai if f["file_path"] in files}
+    assert ai_touched_paths, "expected at least one AI finding inside a mirrored file"
+    for path in ai_touched_paths:
+        assert files[path] == 1, f"{path} produced an AI finding but was not marked analyzed"
+
 
 @pytest.mark.asyncio
 async def test_audit_still_works_without_a_model(site_server, scan_dir, monkeypatch):
@@ -258,6 +348,64 @@ async def test_audit_still_works_without_a_model(site_server, scan_dir, monkeypa
     assert report["llm_error"]
     assert "Rule-based" in report["verdict"]
     assert db.list_findings(scan_id)
+
+    # no finding may be mislabelled as the AI's when the AI never answered
+    assert all(f["source"] != "ai" for f in db.list_findings(scan_id))
+
+    cov = report["coverage"]
+    assert cov["ai_available"] is False
+    assert cov["files_ai_reviewed"] == 0
+    assert cov["chunks_ai_answered"] == 0
+    assert cov["findings_from_ai"] == 0
+    # nothing in the mirror was ever marked as AI-analyzed
+    assert all(r["analyzed"] == 0 for r in db.list_files(scan_id))
+
+
+@pytest.mark.asyncio
+async def test_coverage_never_credits_a_file_the_model_failed_to_answer(
+    site_server, scan_dir, monkeypatch,
+):
+    """A file sent to the model but never successfully parsed must not be
+    reported as AI-reviewed — being asked is not the same as being read."""
+    monkeypatch.setattr(settings, "crawl_respect_robots", False)
+
+    class GarbageLLM:
+        model = "garbage"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def json_chat(self, messages, **kwargs):
+            self.calls += 1
+            raise ValueError("model never produces parseable JSON in this test")
+
+        async def chat(self, messages, **kwargs):
+            return "not json"
+
+    scan_id = db.create_scan(site_server, "127.0.0.1")
+    dest = settings.scan_path(scan_id)
+    crawl = await SiteDownloader(site_server, dest).run()
+    db.add_files(scan_id, crawl.files)
+
+    llm = GarbageLLM()
+    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=llm).run()
+
+    assert llm.calls > 0, "the model must actually have been sent chunks"
+
+    cov = report["coverage"]
+    assert cov["ai_available"] is True          # the model was reachable
+    assert cov["chunks_sent_to_ai"] > 0          # and it was asked
+    assert cov["chunks_ai_answered"] == 0        # but it never gave a usable answer
+    assert cov["files_ai_reviewed"] == 0         # so no file counts as AI-reviewed
+    assert cov["findings_from_ai"] == 0
+
+    # every finding on the board came from rules/headers/probes, not the model
+    findings = db.list_findings(scan_id)
+    assert findings, "the fixture's planted bugs should still be caught by rules"
+    assert all(f["source"] != "ai" for f in findings)
+
+    # the DB agrees: nothing is marked analyzed despite being queued
+    assert all(r["analyzed"] == 0 for r in db.list_files(scan_id))
 
 
 def test_duplicate_findings_are_collapsed(scan_dir):

@@ -121,9 +121,11 @@ class ScriptedAgentLLM:
     def __init__(self, script):
         self.script = list(script)
         self.seen: list[str] = []
+        self.json_modes: list[bool] = []
 
-    async def chat(self, messages, **kwargs):
+    async def chat(self, messages, *, json_mode=False, **kwargs):
         self.seen.append(messages[-1]["content"])
+        self.json_modes.append(json_mode)
         return json.dumps(self.script.pop(0)) if self.script else json.dumps(
             {"thought": "done", "tool": "finish", "args": {"answer": "fallback"}}
         )
@@ -163,6 +165,41 @@ async def test_loop_runs_tools_then_finishes(workspace):
 
     # observations really were fed back to the model
     assert any("OBSERVATION from grep" in m for m in llm.seen)
+
+    # every action turn asked Ollama to constrain its output to JSON
+    assert all(llm.json_modes), "the agent must request grammar-constrained JSON"
+
+
+@pytest.mark.asyncio
+async def test_loop_stops_retrying_json_mode_after_first_rejection(workspace):
+    """If the server rejects format:"json" once, the loop should not pay that
+    cost again on every remaining turn of the same run."""
+    scan_id, root = workspace
+
+    from app.analysis.llm import OllamaUnavailable
+
+    class RejectsJsonMode:
+        def __init__(self):
+            self.json_modes: list[bool] = []
+            self.step = 0
+
+        async def chat(self, messages, *, json_mode=False, **kwargs):
+            self.json_modes.append(json_mode)
+            if json_mode:
+                raise OllamaUnavailable("400: unknown parameter 'format'")
+            self.step += 1
+            if self.step >= 3:
+                return json.dumps({"thought": "done", "tool": "finish",
+                                   "args": {"answer": "done without json mode"}})
+            return json.dumps({"thought": "again", "tool": "list_files", "args": {}})
+
+    llm = RejectsJsonMode()
+    result = await Investigator(scan_id, root, "task", llm=llm, max_steps=10).run()
+
+    assert result["answer"] == "done without json mode"
+    # exactly one rejected attempt, not one per step
+    assert llm.json_modes.count(True) == 1
+    assert llm.json_modes.count(False) == 3  # the retry plus two clean turns
 
 
 @pytest.mark.asyncio

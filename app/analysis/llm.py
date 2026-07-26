@@ -59,6 +59,7 @@ class Ollama:
         num_ctx: int | None = None,
         timeout: float = 300.0,
         stop: Iterable[str] | None = None,
+        json_mode: bool = False,
     ) -> str:
         payload = {
             "model": self.model,
@@ -71,6 +72,13 @@ class Ollama:
         }
         if stop:
             payload["options"]["stop"] = list(stop)
+        if json_mode:
+            # Ollama's grammar-constrained decoding: the model is only allowed
+            # to sample tokens that keep the output valid JSON. This is what
+            # actually makes the auditor's structured findings reliable —
+            # without it we are just hoping a chatty local model remembers to
+            # skip the markdown fence and the "Sure, here's the analysis:".
+            payload["format"] = "json"
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 resp = await c.post(f"{self.host}/api/chat", json=payload)
@@ -123,10 +131,26 @@ class Ollama:
     # ------------------------------------------------------------------ json
     async def json_chat(self, messages: list[dict], *, temperature: float = 0.05,
                         retries: int = 2) -> dict | list:
-        """Ask for JSON and keep asking until something parses."""
+        """Ask for JSON and keep asking until something parses.
+
+        Grammar-constrained decoding (`format: "json"`) is tried first — it is
+        the difference between the model reliably reporting what it found and
+        a free-text reply our parser has to gamble on. If a build or model
+        rejects the constraint outright, we fall back to plain decoding plus
+        text extraction rather than losing the finding entirely.
+        """
         last = ""
+        constrained = True
         for attempt in range(retries + 1):
-            raw = await self.chat(messages, temperature=temperature)
+            try:
+                raw = await self.chat(messages, temperature=temperature,
+                                      json_mode=constrained)
+            except OllamaUnavailable:
+                if not constrained:
+                    raise
+                constrained = False
+                raw = await self.chat(messages, temperature=temperature,
+                                      json_mode=False)
             last = raw
             parsed = extract_json(raw)
             if parsed is not None:
@@ -180,4 +204,9 @@ def _repair(text: str) -> str:
     text = re.sub(r"//[^\n]*", "", text)                 # line comments
     text = text.replace("“", '"').replace("”", '"')
     text = text.replace("‘", "'").replace("’", "'")
+    # A model trained mostly on Python sometimes drifts into Python literals
+    # instead of JSON ones — cheap enough to fix, common enough to bother.
+    text = re.sub(r"\bTrue\b", "true", text)
+    text = re.sub(r"\bFalse\b", "false", text)
+    text = re.sub(r"\bNone\b", "null", text)
     return text.strip()
