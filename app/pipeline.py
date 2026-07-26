@@ -35,7 +35,7 @@ async def run_scan(scan_id: str, url: str) -> None:
                                     "progress": 0.01, "message": "Starting"})
 
         # ---------------------------------------------------------- download
-        downloader = SiteDownloader(url, dest, on_progress=progress)
+        downloader = SiteDownloader(url, dest, on_progress=progress, on_file=event)
         crawl = await downloader.run()
         crawl_dict = crawl.as_dict()
 

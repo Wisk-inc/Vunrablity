@@ -48,30 +48,52 @@ hands the model its hits as hints to confirm, downgrade, or reject.
 CWE, the exact offending line, why it is exploitable **here**, and the specific
 change to make.
 
-**6. Runs your code, for real.** The mirror is mounted into a Docker container
-via [llm-sandbox](https://github.com/vndee/llm-sandbox). The agent can execute
-the files it flagged, write and run its own scripts, and grep the tree — the
-same way [gpt-engineer](https://github.com/AntonOsika/gpt-engineer) works, but
-pointed at auditing instead of authoring. There is a terminal in the UI so you
-can drive it yourself.
+**6. Runs your code, for real.** The mirror lands in a sandbox — a Docker
+container via [llm-sandbox](https://github.com/vndee/llm-sandbox) where a
+daemon exists, otherwise a local workspace so it still works on Replit. The
+agent writes files, creates directories, installs packages, clones from GitHub,
+runs what it wrote, and serves the site so you can click through it — the shape
+of capability [gpt-engineer](https://github.com/AntonOsika/gpt-engineer) and
+Replit's agent have, pointed at auditing.
 
-**7. Then you chat.** The scan redirects you into a chat with the model that
-did the reading. Ask why something matters, ask for the patch, or tell it to go
-verify a finding and watch it work step by step.
+**7. Then you chat — no modes.** Ask a question and you get an answer. Say
+"write a script that scans every JS file for secrets, then run it" and it does
+exactly that, streaming the file into existence character by character, running
+it, and telling you what came back. The model decides whether to talk or act;
+you never flip a switch.
 
 ---
 
-## Install
+## Run it on Replit
 
-Requires **Python 3.11+**, **Docker**, and **[Ollama](https://ollama.com)**.
+Import the repo and press Run. That is the whole setup — `.replit` selects the
+Docker-free sandbox backend and `run.py` binds `0.0.0.0:$PORT` on its own.
+
+Ollama does not run inside a Repl, so point the app at one you host:
+
+```
+OLLAMA_HOST = https://your-ollama-host
+OLLAMA_MODEL = qwen2.5-coder:3b
+```
+
+Set those in the Repl's Secrets pane. Without them the crawler, rule engine,
+header checks and sandbox all still work — only the model's own reading stops,
+and the UI says so rather than pretending otherwise.
+
+---
+
+## Install locally
+
+Requires **Python 3.11+** and **[Ollama](https://ollama.com)**. Docker is
+optional — without it the sandbox falls back to the local backend.
 
 ```bash
 git clone https://github.com/Wisk-inc/Vunrablity.git && cd Vunrablity
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-ollama pull qwen2.5-coder:7b        # or any code-capable model
-docker pull python:3.11-slim        # the sandbox base image
+ollama pull qwen2.5-coder:3b        # small enough for a laptop
+docker pull python:3.11-slim        # optional: stronger sandbox isolation
 
 cp .env.example .env                # optional — every value has a default
 python run.py
@@ -90,37 +112,65 @@ Everything lives in `.env` (see `.env.example`). The values worth knowing:
 
 | Setting | Default | What it controls |
 | --- | --- | --- |
-| `OLLAMA_MODEL` | `qwen2.5-coder:7b` | The model that reads your code |
+| `OLLAMA_MODEL` | `qwen2.5-coder:3b` | The model that reads your code |
 | `OLLAMA_NUM_CTX` | `8192` | Context window; bigger = more lines per pass |
-| `CRAWL_MAX_PAGES` | `400` | Page budget for the crawl |
-| `CRAWL_MAX_ASSETS` | `1500` | Asset budget |
+| `CRAWL_MAX_PAGES` | `5000` | Page budget for the crawl |
+| `CRAWL_MAX_ASSETS` | `20000` | Asset budget |
+| `CRAWL_EXTERNAL_ASSETS` | `true` | Also mirror CDN/third-party bundles |
 | `CRAWL_FOLLOW_SUBDOMAINS` | `true` | Follow `*.yourdomain.com` |
 | `CRAWL_RESPECT_ROBOTS` | `true` | Honour `robots.txt` |
 | `ANALYSIS_CHUNK_LINES` | `120` | Lines per reading window |
 | `ANALYSIS_MAX_FILES` | `400` | Cap on files sent to the model |
-| `SANDBOX_BACKEND` | `auto` | `auto` \| `llm-sandbox` \| `docker` \| `none` |
+| `SANDBOX_BACKEND` | `auto` | `auto` \| `docker` \| `local` \| `llm-sandbox` \| `none` |
 | `SANDBOX_IMAGE` | `python:3.11-slim` | Container base image |
-| `SANDBOX_NETWORK` | `none` | Sandbox networking. Leave it off. |
+| `SANDBOX_NETWORK` | `bridge` | The agent needs it to clone from GitHub |
 | `AGENT_MAX_STEPS` | `25` | Tool calls per agent investigation |
 
-A bigger model reads better. `qwen2.5-coder:14b` or `deepseek-coder-v2` are
-noticeably sharper on subtle logic bugs if you have the VRAM.
+A bigger model reads better. `qwen2.5-coder:7b` or `14b` are noticeably
+sharper on subtle logic bugs if you have the memory; `3b` is the default
+because it runs comfortably almost anywhere.
 
 ---
 
 ## The sandbox
 
-One container per scan, started on demand:
+Two backends, picked automatically:
 
-- the downloaded copy is bind-mounted **read-only** at `/mirror`
-- a writable `tmpfs` copy lives at `/work` — the agent can break it freely
-- `--network none`, so the sandbox can never be turned back on the live site
-- `--read-only` root, `--cap-drop ALL`, `--security-opt no-new-privileges`
-- capped at 1 GB memory, 1 CPU, 256 PIDs
+**`docker`** — used when a daemon is reachable. The download is bind-mounted
+read-only at `/mirror`, a writable copy lives at `/work`, the root filesystem is
+read-only, all capabilities are dropped, `no-new-privileges` is set, and it is
+capped at 2 GB / 2 CPUs / 256 PIDs.
 
-The agent's tools are `list_files`, `read_file`, `grep`, `run`, `python`,
-`write_file`, `add_finding`, `remember`, and `finish`. Reads are resolved
-against the scan directory and rejected if they try to escape it.
+**`local`** — used when there is no daemon, which is the Replit case. A
+dedicated workspace directory driven by subprocesses, with CPU and memory
+rlimits, a wall-clock timeout on every command, and process-group kill so a
+command that spawns children cleans up fully.
+
+The local backend is **containment, not isolation**: commands run as the same
+OS user as the server. That is stated in the UI too, not just here. Where a
+daemon exists, prefer `SANDBOX_BACKEND=docker`.
+
+Either way the agent gets the internet (so it can `git clone` reference code)
+and the original download is never modified — it works on a copy.
+
+### What the agent can do
+
+Written as fenced actions in its reply, executed the moment each block closes:
+
+| | |
+| --- | --- |
+| `write` `append` `read` | files, in any format, creating directories as needed |
+| `mkdir` `move` `copy` `delete` | reorganise the tree |
+| `list` `tree` `grep` | find things |
+| `run` `python` `node` | execute — the body is the command or the code |
+| `install` | `pip` or `npm` packages |
+| `fetch` | clone a GitHub repo or download a file |
+| `serve` `logs` `stop` | run the site so you can click through it |
+| `finding` `remember` | record an issue, or keep a fact for later |
+
+A plain ` ```python ` block is a code *sample* and never runs. Only
+` ```tool:python ` executes. That distinction is enforced by the parser and
+covered by tests.
 
 ---
 
@@ -135,12 +185,18 @@ app/
                 headers.py        response-header and exposure checks
                 analyzer.py       the line-by-line reading loop
                 prompts.py        every prompt, in one place
-  agent/        tools.py · loop.py                          the investigator
-  sandbox/      runner.py                                   the container
-  static/       index.html · chat.html · css/ · js/         the UI
+  agent/        protocol.py       streaming fence parser (prose vs. actions)
+                actions.py        one method per action, run against the sandbox
+                conversation.py   the single no-modes chat loop
+                prompt.py         the system prompt
+  sandbox/      runner.py         Docker backend + backend selection
+                local.py          Docker-free backend (Replit)
+  static/       index.html · chat.html                       the two pages
+                js/highlight.js   dependency-free syntax highlighting
+                js/chat.js        streaming UI, file viewer/editor, preview
   main.py       HTTP + WebSocket surface
   pipeline.py   download → index → audit → report
-tests/          51 tests, including a deliberately-broken fixture site and a
+tests/          63 tests, including a deliberately-broken fixture site and a
                 real-Ollama integration test that skips without one
 ```
 
@@ -149,7 +205,7 @@ tests/          51 tests, including a deliberately-broken fixture site and a
 ## Tests
 
 ```bash
-pytest                       # 51 tests, ~10 seconds
+pytest                       # 63 tests, ~7 seconds
 ```
 
 `tests/fixtures/site/` is a small website with real planted bugs — a leaked

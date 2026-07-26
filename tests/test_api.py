@@ -19,7 +19,7 @@ def client(scan_dir):
 
 def test_pages_are_served(client):
     assert "Vunrablity" in client.get("/").text
-    assert "Security review" in client.get("/chat").text
+    assert "Workspace" in client.get("/chat").text
     assert client.get("/static/css/app.css").status_code == 200
 
 
@@ -93,11 +93,34 @@ def test_chat_websocket_rejects_unknown_scans(client):
         assert ws.receive_json()["type"] == "error"
 
 
-def test_agent_intent_detection():
-    from app.chat import wants_agent
+def test_action_fences_are_distinguished_from_code_samples():
+    """The unified agent has no modes: it decides to act by opening a
+    ```tool: fence. An ordinary ```python block must never execute."""
+    from app.agent.protocol import StreamParser
 
-    assert wants_agent("run a grep for hard-coded keys")
-    assert wants_agent("can you verify that XSS is real?")
-    assert wants_agent("Prove it")
-    assert not wants_agent("what does CWE-79 mean?")
-    assert not wants_agent("which finding should I care about most")
+    def parse(text):
+        parser = StreamParser()
+        events = []
+        for ch in text:          # one character at a time: the real stream case
+            events += parser.feed(ch)
+        return events + parser.flush()
+
+    events = parse(
+        'Here is what that code does:\n'
+        '```python\n'
+        'os.system("rm -rf /")\n'
+        '```\n'
+        'Now let me actually check:\n'
+        '```tool:run\n'
+        'ls site\n'
+        '```\n'
+    )
+    opened = [p for k, p in events if k == "tool_open"]
+    closed = [p for k, p in events if k == "tool_close"]
+    prose = "".join(p for k, p in events if k == "text")
+
+    assert len(opened) == 1 and opened[0]["tool"] == "run"
+    assert closed[0]["body"].strip() == "ls site"
+    # the illustrative snippet stayed prose and was never executed
+    assert "os.system" in prose
+    assert "rm -rf" not in closed[0]["body"]

@@ -17,6 +17,7 @@ const cancelBtn = $("cancelBtn");
 const STAGE_ORDER = ["fetching", "downloaded", "analyzing", "done"];
 let socket = null;
 let scanId = null;
+let mirrored = 0;
 
 /* ------------------------------------------------------------------ health */
 (async function health() {
@@ -87,6 +88,22 @@ function listen(id) {
         setProgress(e.progress, e.message, e.stage);
         log(stageGlyph(e.stage), e.message);
         break;
+
+      case "mirrored_file": {
+        // Every downloaded file shows up here as it lands, so it is obvious
+        // that the whole site is being taken, not just a few pages.
+        mirrored += 1;
+        $("mirrorCount").textContent = `${mirrored} files mirrored`;
+        const row = document.createElement("div");
+        row.className = "lf";
+        row.innerHTML = `<b></b><span class="sz">${fmtBytes(e.bytes)}</span>`;
+        row.querySelector("b").textContent = e.path;
+        const box = $("liveFiles");
+        box.appendChild(row);
+        box.scrollTop = box.scrollHeight;
+        while (box.children.length > 300) box.removeChild(box.firstChild);
+        break;
+      }
 
       case "inventory":
         log("▣", `${e.files} files · ${fmtBytes(e.bytes)} · ` +

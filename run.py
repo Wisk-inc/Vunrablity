@@ -11,8 +11,10 @@ from app.config import settings
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Vunrablity — website vulnerability assessor")
-    parser.add_argument("--host", default=settings.host)
-    parser.add_argument("--port", type=int, default=settings.port)
+    # Defaults come from the environment so Replit's $PORT and 0.0.0.0 bind
+    # work with no flags: `python run.py` is the whole story there.
+    parser.add_argument("--host", default=settings.bind_host)
+    parser.add_argument("--port", type=int, default=settings.bind_port)
     parser.add_argument("--reload", action="store_true", help="auto-reload on code changes")
     args = parser.parse_args()
 

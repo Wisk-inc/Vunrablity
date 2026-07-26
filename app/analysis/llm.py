@@ -82,7 +82,8 @@ class Ollama:
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 resp = await c.post(f"{self.host}/api/chat", json=payload)
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    raise OllamaUnavailable(_explain(resp, self.model, self.host))
                 return resp.json().get("message", {}).get("content", "")
         except httpx.HTTPError as exc:
             raise OllamaUnavailable(
@@ -110,7 +111,12 @@ class Ollama:
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 async with c.stream("POST", f"{self.host}/api/chat", json=payload) as r:
-                    r.raise_for_status()
+                    if r.status_code >= 400:
+                        # Ollama puts the real reason in the body ("model not
+                        # found", "out of memory"). Surfacing only the status
+                        # code turns a fixable problem into a mystery.
+                        await r.aread()
+                        raise OllamaUnavailable(_explain(r, self.model, self.host))
                     async for line in r.aiter_lines():
                         if not line.strip():
                             continue
@@ -165,6 +171,33 @@ class Ollama:
 
 
 # --------------------------------------------------------------------------- helpers
+def _explain(response, model: str, host: str) -> str:
+    """Turn an Ollama error response into something the user can act on."""
+    try:
+        detail = response.json().get("error", "")
+    except Exception:
+        try:
+            detail = response.text[:300]
+        except Exception:
+            detail = ""
+    detail = (detail or "").strip()
+    lowered = detail.lower()
+
+    if "not found" in lowered or "no such model" in lowered or "try pulling" in lowered:
+        return (f"Ollama does not have '{model}'. Run:  ollama pull {model}"
+                + (f"\n({detail})" if detail else ""))
+    if "memory" in lowered or "oom" in lowered or "allocate" in lowered:
+        return (f"Ollama ran out of memory loading '{model}'. Try a smaller "
+                f"model (OLLAMA_MODEL=qwen2.5-coder:1.5b) or lower "
+                f"OLLAMA_NUM_CTX.\n({detail})")
+    if "format" in lowered:
+        return (f"This Ollama build rejected the JSON format option: {detail}. "
+                f"Upgrade Ollama, or the app will retry without it.")
+    return (f"Ollama at {host} returned HTTP {response.status_code} for "
+            f"'{model}'" + (f": {detail}" if detail else ".")
+            + f"\nCheck `ollama list` and `ollama run {model}`.")
+
+
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 

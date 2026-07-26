@@ -26,6 +26,7 @@ from ..config import settings
 from . import discovery, urls as U
 
 ProgressFn = Callable[[str, float, str], Awaitable[None]]
+EventFn = Callable[[str, dict], Awaitable[None]]
 
 USER_AGENT = (
     "Mozilla/5.0 (compatible; Vunrablity/1.0; +self-assessment scanner) "
@@ -67,6 +68,7 @@ class CrawlResult:
     forms: list[dict] = field(default_factory=list)
     headers: dict[str, dict] = field(default_factory=dict)
     exposures: list[dict] = field(default_factory=list)
+    external_hosts: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
@@ -79,6 +81,7 @@ class CrawlResult:
             "file_count": len(self.files),
             "total_bytes": sum(f.get("bytes", 0) for f in self.files),
             "hosts": sorted(self.hosts),
+            "external_hosts": sorted(self.external_hosts),
             "endpoints": sorted(self.endpoints)[:500],
             "forms": self.forms,
             "headers": self.headers,
@@ -89,7 +92,8 @@ class CrawlResult:
 
 
 class SiteDownloader:
-    def __init__(self, url: str, dest: Path, on_progress: ProgressFn | None = None):
+    def __init__(self, url: str, dest: Path, on_progress: ProgressFn | None = None,
+                 on_file: "EventFn | None" = None):
         self.root_url = U.normalize(url)
         self.root_domain = U.registrable_domain(self.root_url)
         self.origin = f"{urlparse(self.root_url).scheme}://{urlparse(self.root_url).netloc}"
@@ -99,6 +103,7 @@ class SiteDownloader:
         self.site_dir.mkdir(parents=True, exist_ok=True)
         self.sources_dir.mkdir(parents=True, exist_ok=True)
         self.on_progress = on_progress
+        self.on_file = on_file
 
         self.result = CrawlResult(self.root_url, self.root_domain, self.dest)
         self.seen: set[str] = set()
@@ -106,6 +111,7 @@ class SiteDownloader:
         self._robots: dict[str, robotparser.RobotFileParser] = {}
         self._pages_done = 0
         self._assets_done = 0
+        self._pending_announce: list[dict] = []
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ public
@@ -128,6 +134,7 @@ class SiteDownloader:
             await self._crawl_pages()
             await self._drain_assets()
             await self._probe_exposures()
+        await self._flush_announcements()
         self.result.files = list(self.saved.values())
         self.result.finished_at = time.time()
         self._write_inventory()
@@ -208,6 +215,8 @@ class SiteDownloader:
         elif "css" in ctype or rel.endswith(".css"):
             await self._enqueue(discovery.from_css(url, text), depth + 1)
 
+        await self._flush_announcements()
+
         if done % 5 == 0:
             pct = 0.05 + 0.25 * min(1.0, done / max(1, settings.crawl_max_pages))
             await self._emit("fetching", pct, f"Crawled {done} pages · {url}")
@@ -259,6 +268,8 @@ class SiteDownloader:
                     found = discovery.from_css(url, body.decode("utf-8", "replace"))
                     for a in found.assets:
                         await self._push_asset(a)
+
+                await self._flush_announcements()
 
                 if done % 25 == 0:
                     pct = 0.30 + 0.12 * min(1.0, done / max(1, settings.crawl_max_assets))
@@ -319,13 +330,33 @@ class SiteDownloader:
             await self._push_asset(asset)
 
     async def _push_asset(self, url: str) -> None:
-        if url in self.seen or not self._in_scope(url):
+        if url in self.seen or not self._asset_in_scope(url):
             return
         self.seen.add(url)
         await self.asset_queue.put(url)
 
     def _in_scope(self, url: str) -> bool:
+        """Navigation scope: which *pages* the crawler will walk into."""
         return U.same_site(url, self.root_domain, settings.crawl_follow_subdomains)
+
+    def _asset_in_scope(self, url: str) -> bool:
+        """Asset scope: which *files* get mirrored.
+
+        Deliberately wider than navigation scope. A bundle served from a CDN,
+        a third-party widget, an API on another host — all of it executes in
+        your users' browsers and all of it is part of what has to be reviewed.
+        Refusing to download it because the hostname differs is how a mirror
+        ends up with "only some of the pages".
+        """
+        if self._in_scope(url):
+            return True
+        if not settings.crawl_external_assets:
+            return False
+        host = U.hostname_of(url)
+        if not host:
+            return False
+        self.result.external_hosts.add(host)
+        return True
 
     def _allowed(self, url: str) -> bool:
         if not settings.crawl_respect_robots:
@@ -400,6 +431,27 @@ class SiteDownloader:
         rel = str(target.relative_to(self.dest)).replace(os.sep, "/")
         self._register(rel, target, origin_url, None, kind=kind)
 
+    async def _flush_announcements(self) -> None:
+        """Emit one event per newly mirrored file.
+
+        `_register` is synchronous (it is called from sync persist helpers), so
+        it queues records here and the async callers drain the queue. That keeps
+        the browser's "files downloaded" list updating live during the crawl.
+        """
+        if not self.on_file or not self._pending_announce:
+            self._pending_announce.clear()
+            return
+        pending, self._pending_announce = self._pending_announce, []
+        for record in pending:
+            await self.on_file("mirrored_file", {
+                "path": record["path"],
+                "url": record.get("url"),
+                "bytes": record.get("bytes", 0),
+                "lines": record.get("lines", 0),
+                "language": record.get("language"),
+                "kind": record.get("kind"),
+            })
+
     def _register(self, rel: str, path: Path, url: str, ctype: str | None,
                   kind: str | None = None) -> None:
         data = path.read_bytes()
@@ -417,6 +469,7 @@ class SiteDownloader:
             "sha256": hashlib.sha256(data).hexdigest(),
             "content_type": ctype,
         }
+        self._pending_announce.append(self.saved[rel])
 
     def _write_inventory(self) -> None:
         (self.dest / "inventory.json").write_text(

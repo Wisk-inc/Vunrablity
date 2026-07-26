@@ -81,6 +81,15 @@ CREATE TABLE IF NOT EXISTS memory (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS activity (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_scan ON activity(scan_id);
 CREATE INDEX IF NOT EXISTS idx_files_scan     ON files(scan_id);
 CREATE INDEX IF NOT EXISTS idx_findings_scan  ON findings(scan_id);
 CREATE INDEX IF NOT EXISTS idx_messages_scan  ON messages(scan_id);
@@ -300,3 +309,31 @@ def list_memory(scan_id: str, kind: str | None = None, limit: int = 400) -> list
             (scan_id, limit),
         )
     return _rows(cur)
+
+
+# --------------------------------------------------------------------------- activity
+def add_activity(scan_id: str, kind: str, payload: Any) -> None:
+    """Record what the agent did, so a page refresh can replay it."""
+    conn = connect()
+    conn.execute(
+        "INSERT INTO activity (scan_id, kind, payload, created_at) VALUES (?,?,?,?)",
+        (scan_id, kind, json.dumps(payload), time.time()),
+    )
+    conn.commit()
+
+
+def list_activity(scan_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    cur = connect().execute(
+        "SELECT kind, payload, created_at FROM activity WHERE scan_id = ?"
+        " ORDER BY id ASC LIMIT ?",
+        (scan_id, limit),
+    )
+    out = []
+    for row in cur.fetchall():
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item["payload"])
+        except (TypeError, ValueError):
+            item["payload"] = {}
+        out.append(item)
+    return out

@@ -1,0 +1,39 @@
+# Replit entry point. `python run.py` binds 0.0.0.0:$PORT automatically
+# (see Settings.bind_host / bind_port), which is what Replit routes to.
+run = "python run.py"
+entrypoint = "run.py"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "python run.py"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 8000
+externalPort = 80
+
+# Ports the sandbox agent may bind for previews.
+[[ports]]
+localPort = 8080
+externalPort = 3000
+
+[[ports]]
+localPort = 3000
+externalPort = 3001
+
+[env]
+# Replit has no Docker daemon — the local backend is the supported path here.
+SANDBOX_BACKEND = "local"
+# A 3B model fits comfortably in a Repl's memory.
+OLLAMA_MODEL = "qwen2.5-coder:3b"
+PYTHONUNBUFFERED = "1"
+
+[packager]
+language = "python3"
+
+[packager.features]
+packageSearch = true
+guessImports = true

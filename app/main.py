@@ -6,7 +6,9 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import (FastAPI, HTTPException, Query, Request, Response, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -14,7 +16,7 @@ from pydantic import BaseModel, Field
 from . import db, pipeline
 from .analysis import severity as sev
 from .analysis.llm import Ollama
-from .chat import ChatService, wants_agent
+from .agent import Conversation
 from .config import settings
 from .crawler import urls as U
 from .events import bus
@@ -49,6 +51,11 @@ class ChatRequest(BaseModel):
 class ExecRequest(BaseModel):
     command: str
     timeout: int | None = None
+
+
+class WriteRequest(BaseModel):
+    path: str
+    content: str
 
 
 # --------------------------------------------------------------------------- pages
@@ -256,49 +263,36 @@ async def ws_scan(ws: WebSocket, scan_id: str):
 
 @app.websocket("/ws/chat/{scan_id}")
 async def ws_chat(ws: WebSocket, scan_id: str):
+    """One socket, one conversation. The model decides whether to talk or act."""
     await ws.accept()
     if not db.get_scan(scan_id):
         await ws.send_json({"type": "error", "message": "unknown scan"})
         await ws.close()
         return
 
-    service = ChatService(scan_id)
+    root = settings.scan_path(scan_id)
 
     try:
         while True:
             payload = await ws.receive_json()
             message = str(payload.get("message") or "").strip()
-            mode = str(payload.get("mode") or "auto")
             if not message:
                 continue
 
-            db.add_message(scan_id, "user", message)
-            use_agent = mode == "agent" or (mode == "auto" and wants_agent(message))
+            async def emit(kind: str, data: dict, _ws=ws) -> None:
+                await _ws.send_json({"type": kind, **data})
+                # Persist everything except raw token spam so a refresh replays
+                # the conversation exactly as it happened.
+                if kind in ("action_open", "action_result"):
+                    db.add_activity(scan_id, kind, data)
 
-            if use_agent:
-                await ws.send_json({"type": "agent_start", "task": message})
-
-                async def on_event(kind: str, data: dict) -> None:
-                    await ws.send_json({"type": kind, **data})
-
-                result = await service.investigate(message, on_event)
-                answer = result.get("answer", "")
-                db.add_message(scan_id, "assistant", answer,
-                               meta={"kind": "agent",
-                                     "steps": result.get("steps"),
-                                     "findings": len(result.get("findings", []))})
-                await ws.send_json({"type": "answer", "content": answer,
-                                    "mode": "agent",
-                                    "new_findings": result.get("findings", [])})
-            else:
-                await ws.send_json({"type": "answer_start"})
-                collected: list[str] = []
-                async for piece in service.stream_answer(message):
-                    collected.append(piece)
-                    await ws.send_json({"type": "token", "content": piece})
-                answer = "".join(collected)
-                db.add_message(scan_id, "assistant", answer, meta={"kind": "chat"})
-                await ws.send_json({"type": "answer_end", "content": answer})
+            conversation = Conversation(scan_id, root, emit=emit)
+            try:
+                await conversation.send(message)
+            except Exception as exc:
+                await ws.send_json({"type": "error",
+                                    "message": f"{type(exc).__name__}: {exc}"})
+                await ws.send_json({"type": "turn_end", "content": "", "actions": 0})
 
     except WebSocketDisconnect:
         return
@@ -308,6 +302,109 @@ async def ws_chat(ws: WebSocket, scan_id: str):
                                 "message": f"{type(exc).__name__}: {exc}"})
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- workspace
+@app.get("/api/scan/{scan_id}/workspace/tree")
+async def workspace_tree(scan_id: str, path: str = "", depth: int = 4):
+    """The agent's live workspace, for the file explorer."""
+    box = Sandbox.get(scan_id, settings.scan_path(scan_id))
+    try:
+        return {"entries": await asyncio.to_thread(box.tree, path, depth)}
+    except SandboxUnavailable as exc:
+        raise HTTPException(503, str(exc))
+
+
+@app.get("/api/scan/{scan_id}/workspace/file")
+async def workspace_file(scan_id: str, path: str = Query(...)):
+    box = Sandbox.get(scan_id, settings.scan_path(scan_id))
+    try:
+        await asyncio.to_thread(box.start)
+        content = await asyncio.to_thread(box.read_file, path, 1, 100_000)
+    except SandboxUnavailable as exc:
+        raise HTTPException(503, str(exc))
+    return {"path": path, "content": content,
+            "lines": content.count("\n") + 1, "language": _language_of(path)}
+
+
+@app.post("/api/scan/{scan_id}/workspace/file")
+async def workspace_write(scan_id: str, req: WriteRequest):
+    """Save an edit made in the browser back into the workspace."""
+    box = Sandbox.get(scan_id, settings.scan_path(scan_id))
+    try:
+        result = await asyncio.to_thread(box.write_file, req.path, req.content)
+    except SandboxUnavailable as exc:
+        raise HTTPException(503, str(exc))
+    if not result.ok:
+        raise HTTPException(400, result.output)
+    return {"saved": True, "path": req.path, "bytes": len(req.content)}
+
+
+@app.get("/api/scan/{scan_id}/services")
+async def list_services(scan_id: str):
+    box = Sandbox.get(scan_id, settings.scan_path(scan_id))
+    try:
+        return {"services": box.services(), "info": box.info()}
+    except SandboxUnavailable as exc:
+        return {"services": [], "info": {"error": str(exc)}}
+
+
+@app.api_route("/preview/{scan_id}/{port}/{path:path}",
+               methods=["GET", "POST", "HEAD"])
+async def preview(scan_id: str, port: int, path: str, request: Request):
+    """Proxy to a server the agent started, so its pages are clickable here.
+
+    Only ports the agent actually bound are reachable, and only on loopback —
+    this is a window into the sandbox, not an open relay.
+    """
+    box = Sandbox.get(scan_id, settings.scan_path(scan_id))
+    allowed = {s.get("port") for s in box.services() if s.get("port")}
+    allowed |= set(settings.preview_ports)
+    if port not in allowed:
+        raise HTTPException(403, f"port {port} is not served by this sandbox")
+
+    target = f"http://127.0.0.1:{port}/{path}"
+    if request.url.query:
+        target += f"?{request.url.query}"
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            upstream = await client.request(
+                request.method, target,
+                content=await request.body() if request.method == "POST" else None,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"nothing answering on port {port}: {exc}")
+
+    drop = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    headers = {k: v for k, v in upstream.headers.items() if k.lower() not in drop}
+    return Response(content=upstream.content, status_code=upstream.status_code,
+                    headers=headers,
+                    media_type=upstream.headers.get("content-type"))
+
+
+@app.get("/api/scan/{scan_id}/activity")
+async def activity(scan_id: str):
+    """Replayed on refresh so the conversation survives a reload."""
+    return {"activity": db.list_activity(scan_id)}
+
+
+LANG_BY_EXT = {
+    ".py": "python", ".js": "javascript", ".mjs": "javascript",
+    ".cjs": "javascript", ".jsx": "javascript", ".ts": "typescript",
+    ".tsx": "typescript", ".json": "json", ".html": "html", ".htm": "html",
+    ".css": "css", ".scss": "css", ".sh": "shell", ".bash": "shell",
+    ".yml": "yaml", ".yaml": "yaml", ".md": "markdown", ".sql": "sql",
+    ".php": "php", ".rb": "ruby", ".go": "go", ".rs": "rust", ".java": "java",
+    ".xml": "xml", ".toml": "toml", ".env": "shell",
+}
+
+
+def _language_of(path: str) -> str:
+    name = str(path).lower()
+    for ext, lang in LANG_BY_EXT.items():
+        if name.endswith(ext):
+            return lang
+    return "text"
 
 
 # --------------------------------------------------------------------------- misc

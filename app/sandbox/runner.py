@@ -18,10 +18,12 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import sys
 import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +80,7 @@ class Sandbox:
         self.container: str | None = None
         self.backend: str | None = None
         self._session = None       # llm-sandbox session, when that path is used
+        self._local = None         # LocalSandbox, when running without Docker
         # Reentrant: start() seeds the workspace via exec(), which calls
         # start() again to guarantee the container is up.
         self._start_lock = threading.RLock()
@@ -102,6 +105,8 @@ class Sandbox:
     # ------------------------------------------------------------------ lifecycle
     @property
     def running(self) -> bool:
+        if self.backend == "local":
+            return self._local is not None and self._local.running
         if self.backend == "llm-sandbox":
             return self._session is not None
         if not self.container:
@@ -110,11 +115,12 @@ class Sandbox:
         return out.stdout.strip() == "true"
 
     def start(self) -> None:
-        """Bring the container up. SANDBOX_BACKEND picks how.
+        """Bring the sandbox up. SANDBOX_BACKEND picks how.
 
-        auto         try llm-sandbox, fall back to plain docker  (default)
-        llm-sandbox  require llm-sandbox
+        auto         Docker if a daemon is reachable, else the local backend
         docker       drive the docker CLI directly
+        llm-sandbox  require vndee/llm-sandbox
+        local        subprocess workspace, no daemon needed (Replit, plain hosts)
         none         refuse; sandbox features are disabled
         """
         backend = (settings.sandbox_backend or "auto").lower()
@@ -126,22 +132,40 @@ class Sandbox:
         with self._start_lock:
             if self.running:
                 return
-            if not _docker_available():
-                raise SandboxUnavailable(
-                    "Docker is not reachable. Start Docker Desktop / the daemon, "
-                    "or set SANDBOX_BACKEND=none to disable sandbox features."
-                )
 
-            if backend in ("auto", "llm-sandbox"):
-                if self._try_llm_sandbox():
+            if backend == "local":
+                self._start_local()
+                return
+
+            if backend in ("auto", "llm-sandbox", "docker") and _docker_available():
+                if backend in ("auto", "llm-sandbox") and self._try_llm_sandbox():
                     return
                 if backend == "llm-sandbox":
                     raise SandboxUnavailable(
                         "llm-sandbox could not open a session. Install it "
                         "(`pip install 'llm-sandbox[docker]'`) or set "
-                        "SANDBOX_BACKEND=docker."
+                        "SANDBOX_BACKEND=local."
                     )
-            self._start_docker()
+                self._start_docker()
+                return
+
+            if backend == "auto":
+                # No daemon — this is the Replit/plain-host path, and it is a
+                # supported configuration rather than a failure.
+                self._start_local()
+                return
+
+            raise SandboxUnavailable(
+                "Docker is not reachable. Start the daemon, or set "
+                "SANDBOX_BACKEND=local to run without one."
+            )
+
+    def _start_local(self) -> None:
+        from .local import LocalSandbox
+
+        self._local = LocalSandbox(self.scan_id, self.host_dir)
+        self._local.start()
+        self.backend = "local"
 
     def _try_llm_sandbox(self) -> bool:
         """Use vndee/llm-sandbox when it is importable and its API matches."""
@@ -253,6 +277,11 @@ class Sandbox:
             os.unlink(tar_path)
 
     def stop(self) -> None:
+        if self._local is not None:
+            self._local.stop()
+            self._local = None
+            self.backend = None
+            return
         if self._session is not None:
             try:
                 self._session.close()
@@ -266,9 +295,12 @@ class Sandbox:
 
     # ------------------------------------------------------------------ exec
     def exec(self, command: str, timeout: int | None = None) -> SandboxResult:
-        """Run a shell command inside the container."""
+        """Run a shell command inside the sandbox."""
         self.start()
         timeout = timeout or settings.sandbox_timeout
+
+        if self.backend == "local" and self._local is not None:
+            return self._local.exec(command, timeout)
 
         if self.backend == "llm-sandbox" and self._session is not None:
             result = self._exec_llm_sandbox(command, timeout)
@@ -301,8 +333,10 @@ class Sandbox:
         return _clip_result(command, int(exit_code), str(stdout), str(stderr))
 
     def run_python(self, code: str, timeout: int | None = None) -> SandboxResult:
-        """Execute a Python program inside the container."""
+        """Execute a Python program inside the sandbox."""
         self.start()
+        if self.backend == "local" and self._local is not None:
+            return self._local.run_python(code, timeout)
         script = f"/tmp/vunrablity_{uuid.uuid4().hex[:8]}.py"
         self.write_file(script, code, absolute=True)
         return self.exec(f"python3 {shlex.quote(script)}", timeout=timeout)
@@ -315,6 +349,9 @@ class Sandbox:
         read-only, so the bytes go in through the shell instead.
         """
         self.start()
+        if self.backend == "local" and self._local is not None:
+            return self._local.write_file(path, content, absolute)
+
         target = path if absolute else f"{WORKDIR}/{path.lstrip('/')}"
         parent = os.path.dirname(target) or "/"
 
@@ -345,12 +382,115 @@ class Sandbox:
         return SandboxResult(f"write {target}", 0, f"wrote {len(content)} bytes", "")
 
     def read_file(self, path: str, start: int = 1, end: int | None = None) -> str:
+        if self.backend == "local" and self._local is not None:
+            return self._local.read_file(path, start, end)
         target = f"{WORKDIR}/{path.lstrip('/')}"
         end = end or start + 400
         cmd = f"sed -n '{max(1, start)},{max(start, end)}p' {shlex.quote(target)}"
         return self.exec(cmd).output
 
+    # ------------------------------------------------------------------ services
+    def start_service(self, command: str, name: str | None = None,
+                      port: int | None = None) -> dict:
+        """Run something that keeps running — a dev server, a watcher.
+
+        The agent uses this to actually *serve* the mirrored site so it can be
+        previewed and clicked through, instead of only reading it as text.
+        """
+        self.start()
+        if self.backend == "local" and self._local is not None:
+            return self._local.start_service(command, name, port).as_dict()
+
+        # Container backends: run it detached inside the container.
+        name = name or f"svc-{int(time.time())}"
+        log = f"/tmp/{name}.log"
+        self.exec(f"nohup sh -lc {shlex.quote(command)} > {log} 2>&1 & echo $!")
+        return {"name": name, "command": command, "port": port,
+                "running": True, "log": log, "pid": None}
+
+    def kill_service(self, name: str) -> bool:
+        if self.backend == "local" and self._local is not None:
+            return self._local.kill_service(name)
+        self.exec(f"pkill -f {shlex.quote(name)} || true")
+        return True
+
+    def service_log(self, name: str, tail: int = 200) -> str:
+        if self.backend == "local" and self._local is not None:
+            return self._local.service_log(name, tail)
+        return self.exec(f"tail -n {tail} /tmp/{name}.log 2>/dev/null").output
+
+    def services(self) -> list[dict]:
+        if self.backend == "local" and self._local is not None:
+            return [s.as_dict() for s in self._local.services.values()]
+        return []
+
+    # ------------------------------------------------------------------ packages
+    def install(self, packages: str, manager: str = "pip") -> SandboxResult:
+        """Install dependencies the agent decides it needs."""
+        self.start()
+        pkgs = " ".join(shlex.quote(p) for p in packages.split() if p)
+        if not pkgs:
+            return SandboxResult("install", 1, "", "no packages given")
+        commands = {
+            "pip": f"{shlex.quote(sys.executable)} -m pip install --quiet {pkgs}",
+            "npm": f"npm install --no-fund --no-audit {pkgs}",
+            "apt": f"apt-get install -y {pkgs}",
+        }
+        cmd = commands.get(manager, commands["pip"])
+        return self.exec(cmd, timeout=600)
+
+    # ------------------------------------------------------------------ tree
+    def tree(self, sub: str = "", depth: int = 4, limit: int = 4000) -> list[dict]:
+        """List the workspace so the UI can render a real file explorer."""
+        self.start()
+        root = self.workspace_path
+        if root is None:
+            listing = self.exec(
+                f"find {WORKDIR}/{sub} -maxdepth {depth} -printf '%y\\t%s\\t%P\\n' "
+                f"2>/dev/null | head -{limit}"
+            )
+            out = []
+            for line in listing.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 3:
+                    out.append({"type": "dir" if parts[0] == "d" else "file",
+                                "bytes": int(parts[1] or 0), "path": parts[2]})
+            return out
+
+        base = (root / sub).resolve() if sub else root
+        try:
+            base.relative_to(root)
+        except ValueError:
+            return []
+        out = []
+        for path in sorted(base.rglob("*")):
+            rel = path.relative_to(root)
+            if len(rel.parts) > depth:
+                continue
+            if any(part in (".git", "__pycache__", "node_modules") for part in rel.parts):
+                continue
+            try:
+                out.append({
+                    "type": "dir" if path.is_dir() else "file",
+                    "bytes": path.stat().st_size if path.is_file() else 0,
+                    "path": str(rel),
+                })
+            except OSError:
+                continue
+            if len(out) >= limit:
+                break
+        return out
+
+    @property
+    def workspace_path(self):
+        """Host-side path of the agent's workspace, when there is one."""
+        if self.backend == "local" and self._local is not None:
+            return self._local.workdir
+        return None
+
     def info(self) -> dict:
+        if self.backend == "local" and self._local is not None:
+            return self._local.info()
         return {
             "running": self.running,
             "backend": self.backend,
