@@ -382,6 +382,9 @@ class Sandbox:
         return SandboxResult(f"write {target}", 0, f"wrote {len(content)} bytes", "")
 
     def read_file(self, path: str, start: int = 1, end: int | None = None) -> str:
+        # Without this the backend is still unset on the first call, so a local
+        # sandbox would be read through the container path and find nothing.
+        self.start()
         if self.backend == "local" and self._local is not None:
             return self._local.read_file(path, start, end)
         target = f"{WORKDIR}/{path.lstrip('/')}"

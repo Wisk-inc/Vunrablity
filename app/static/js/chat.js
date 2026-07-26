@@ -19,6 +19,18 @@ const SEV = ["critical", "high", "medium", "low", "info"];
 const LABEL = { critical: "Critical", high: "Dangerous", medium: "Moderate",
                 low: "Small", info: "Info" };
 
+/* A tool block often has no filename (```tool:python, ```tool:run), so the
+   tool itself tells us how to highlight its body. */
+const TOOL_LANG = {
+  python: "python", node: "javascript", run: "shell", bash: "shell",
+  sh: "shell", install: "shell", grep: "shell", serve: "shell",
+};
+
+function actionLanguage(tool, path) {
+  if (path) return hl.guessLanguage(path);
+  return TOOL_LANG[tool] || "text";
+}
+
 const ICON = {
   write: "i-file", append: "i-file", read: "i-file", mkdir: "i-folder",
   move: "i-folder", copy: "i-folder", delete: "i-x", list: "i-folder",
@@ -234,6 +246,8 @@ function connect() {
       case "action_delta":  onActionDelta(e.text); break;
       case "action_result": onActionResult(e); break;
       case "turn_end":      onTurnEnd(); break;
+      case "file_read":     onDeepRead(e); break;
+      case "deepread_done": onDeepDone(e); break;
       case "error":         onToken(`\n\n_${e.message}_\n`); break;
     }
   };
@@ -276,7 +290,7 @@ function onActionOpen(e) {
 function onActionDelta(text) {
   if (!actionEl) return;
   actionBuf += text;
-  const lang = hl.guessLanguage(actionEl.dataset.path || "");
+  const lang = actionLanguage(actionEl.dataset.tool, actionEl.dataset.path);
   actionBodyEl.innerHTML = hl.highlightCode(actionBuf, lang);
   actionEl.querySelector(".state").textContent = `${actionBuf.length} bytes`;
   scrollDown();
@@ -310,12 +324,48 @@ function onTurnEnd() {
   loadScan();
 }
 
+/* ------------------------------------------------------------------ deep read */
+function onDeepRead(e) {
+  // The full read runs in the background; this is its only footprint in the
+  // conversation, so it never interrupts what you are doing.
+  let bar = $("deepBar");
+  if (!bar) {
+    const el = document.createElement("div");
+    el.className = "deepread";
+    el.id = "deepBar";
+    el.innerHTML = `
+      <span class="wave"><i></i><i></i><i></i><i></i><i></i></span>
+      <span class="deep-label"></span>
+      <span class="deep-track"><i></i></span>
+      <button class="chip deep-stop">stop</button>`;
+    el.querySelector(".deep-stop").onclick = async () => {
+      await fetch(`/api/scan/${scanId}/read/stop`, { method: "POST" });
+      el.remove();
+    };
+    document.querySelector(".composer-inner").prepend(el);
+    bar = el;
+  }
+  bar.querySelector(".deep-label").textContent =
+    `reading ${e.done}/${e.total} · ${e.findings} findings`;
+  bar.querySelector(".deep-track i").style.width =
+    `${Math.round(100 * e.done / Math.max(1, e.total))}%`;
+  if (e.done % 5 === 0) loadScan();
+}
+
+function onDeepDone(e) {
+  $("deepBar")?.remove();
+  loadScan();
+  addBubble("assistant",
+    `Finished reading every file — **${e.findings} findings** now on the left.`);
+}
+
 /* ------------------------------------------------------------------ action cards */
 function buildAction(tool, args, body) {
   const el = document.createElement("div");
   el.className = "action";
   const path = args.path || "";
   el.dataset.path = path;
+  el.dataset.tool = tool;
   const label = path || args.url || args.name || args.pattern || "";
   el.innerHTML = `
     <div class="action-head">
@@ -327,7 +377,7 @@ function buildAction(tool, args, body) {
     <div class="action-body"><pre></pre></div>`;
   el.querySelector(".target").textContent = label;
   el.querySelector(".action-body pre").innerHTML =
-    hl.highlightCode(body, hl.guessLanguage(path));
+    hl.highlightCode(body, actionLanguage(tool, path));
   el.querySelector(".action-head").onclick = () => el.classList.toggle("collapsed");
   return el;
 }
@@ -439,6 +489,18 @@ function addBubble(role, content) {
 function scrollDown() {
   requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
 }
+
+/* Reconnect the deep-read bar if a read is already running (e.g. after a
+   refresh) — progress should survive a reload like everything else. */
+(async function resumeDeepRead() {
+  try {
+    const state = await (await fetch(`/api/scan/${scanId}/read`)).json();
+    if (state.state === "running") {
+      onDeepRead({ done: state.done, total: state.total,
+                   findings: state.findings });
+    }
+  } catch { /* nothing running */ }
+})();
 
 /* ------------------------------------------------------------------ drawer */
 function openDrawer(title, sub) {

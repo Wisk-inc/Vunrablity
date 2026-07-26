@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import db, pipeline
+from . import db, deepread, pipeline
 from .analysis import severity as sev
 from .analysis.llm import Ollama
 from .agent import Conversation
@@ -380,6 +380,24 @@ async def preview(scan_id: str, port: int, path: str, request: Request):
     return Response(content=upstream.content, status_code=upstream.status_code,
                     headers=headers,
                     media_type=upstream.headers.get("content-type"))
+
+
+@app.post("/api/scan/{scan_id}/read")
+async def start_deep_read(scan_id: str, glob: str | None = None):
+    """Read every mirrored file with the model, in the background."""
+    if not db.get_scan(scan_id):
+        raise HTTPException(404, "unknown scan")
+    return deepread.start(scan_id, settings.scan_path(scan_id), only=glob)
+
+
+@app.get("/api/scan/{scan_id}/read")
+async def deep_read_status(scan_id: str):
+    return deepread.status(scan_id)
+
+
+@app.post("/api/scan/{scan_id}/read/stop")
+async def stop_deep_read(scan_id: str):
+    return {"stopped": deepread.stop(scan_id)}
 
 
 @app.get("/api/scan/{scan_id}/activity")

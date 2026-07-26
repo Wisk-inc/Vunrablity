@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     analysis_chunk_lines: int = 120
     analysis_chunk_overlap: int = 15
     analysis_max_files: int = 2000
+    # Files are independent, so the deep read runs several at once. This is the
+    # difference between "reads one file at a time" and finishing in minutes.
+    analysis_concurrency: int = 6
+    # A fresh scan does the fast pass only, so the chat opens immediately;
+    # the deep read happens when you ask for it.
+    analysis_deep_on_scan: bool = False
     agent_max_steps: int = 40
 
     data_dir: str = "./data"

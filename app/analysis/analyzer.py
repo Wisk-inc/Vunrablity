@@ -15,6 +15,7 @@ hints — the model confirms, rejects, or upgrades them.
 """
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import time
@@ -86,7 +87,20 @@ class Analyzer:
         self.chunks_answered = 0
 
     # ------------------------------------------------------------------ run
-    async def run(self) -> dict:
+    async def run(self, deep: bool | None = None) -> dict:
+        """Audit the mirror.
+
+        `deep=False` runs only the fast deterministic pass — rules, header
+        checks, exposed-path probes — which finishes in seconds. That is the
+        default on a fresh scan so you can start talking to the agent
+        immediately instead of waiting on a model to read every line.
+
+        `deep=True` adds the line-by-line model review, running several files
+        concurrently.
+        """
+        if deep is None:
+            deep = settings.analysis_deep_on_scan
+
         await self._emit("analyzing", 0.46, "Opening the mirror")
 
         deterministic = self._deterministic_pass()
@@ -94,32 +108,121 @@ class Analyzer:
             self._record(finding)
         await self._emit(
             "analyzing", 0.50,
-            f"{len(deterministic)} issues from headers and exposed paths",
+            f"{len(deterministic)} issues from headers, forms and exposed paths",
         )
 
         queue = self._reading_queue()
         self.files_queued = len(queue)
-        await self._emit("analyzing", 0.52,
-                         f"{len(queue)} files queued for line-by-line review")
 
-        total = max(1, len(queue))
-        for idx, item in enumerate(queue):
-            stats = await self._read_file(item)
-            # A file only counts as AI-reviewed once the model actually
-            # returned a parsed chunk for it — not merely because it was sent.
-            if stats["chunks_ok"] > 0:
-                self.files_ai_reviewed.add(item["path"])
-                db.mark_analyzed(self.scan_id, item["path"])
-            pct = 0.52 + 0.42 * ((idx + 1) / total)
-            await self._emit(
-                "analyzing", pct,
-                f"Read {idx + 1}/{total} · {item['path']} "
-                f"({len(self.findings)} findings so far)",
-            )
+        if not deep:
+            # Rule hits cost nothing — they are already computed while building
+            # the queue. Only the model pass is deferred, not the findings.
+            for item in queue:
+                for hit in item["hits"]:
+                    self._record(static_rules.hit_to_finding(hit, item["path"]))
+            await self._emit("analyzing", 0.9,
+                             f"{len(self.findings)} issues found · {len(queue)} "
+                             f"files indexed and ready to read")
+            report = self._quick_report()
+            await self._emit("done", 1.0, "Ready")
+            return report
+
+        await self._emit("analyzing", 0.52,
+                         f"Reading {len(queue)} files with {self.llm.model}")
+        await self.read_files(queue)
 
         report = await self._write_report()
         await self._emit("done", 1.0, "Audit complete")
         return report
+
+    async def read_files(self, queue: list[dict] | None = None) -> dict:
+        """The deep pass: hand every file to the model, several at a time.
+
+        Reading strictly one file after another is what made this slow — each
+        chunk waits on a full model round-trip. Files are independent, so they
+        run concurrently up to ANALYSIS_CONCURRENCY.
+        """
+        if queue is None:
+            queue = self._reading_queue()
+            self.files_queued = len(queue)
+
+        total = max(1, len(queue))
+        done = 0
+        semaphore = asyncio.Semaphore(max(1, settings.analysis_concurrency))
+        lock = asyncio.Lock()
+
+        async def one(item: dict) -> None:
+            nonlocal done
+            async with semaphore:
+                if not self.llm_available:
+                    return
+                stats = await self._read_file(item)
+                async with lock:
+                    done += 1
+                    if stats["chunks_ok"] > 0:
+                        self.files_ai_reviewed.add(item["path"])
+                        db.mark_analyzed(self.scan_id, item["path"])
+                    pct = 0.52 + 0.42 * (done / total)
+                    await self._emit(
+                        "analyzing", pct,
+                        f"Read {done}/{total} · {item['path']} "
+                        f"({len(self.findings)} findings so far)",
+                    )
+                    await self._event("file_read", {
+                        "path": item["path"], "done": done, "total": total,
+                        "findings": len(self.findings),
+                    })
+
+        await asyncio.gather(*(one(item) for item in queue))
+        return {"read": len(self.files_ai_reviewed), "queued": total,
+                "findings": len(self.findings)}
+
+    def _quick_report(self) -> dict:
+        """A report for the fast pass — honest that nothing has been read yet."""
+        counts = {s: 0 for s in sev.ORDER}
+        for f in self.findings:
+            counts[sev.normalize(f["severity"])] += 1
+        top = sorted(self.findings, key=lambda f: (sev.rank(f["severity"]),
+                                                   -float(f.get("confidence", 0))))[:25]
+        return {
+            "url": self.crawl.get("root_url"),
+            "counts": counts,
+            "total": len(self.findings),
+            "files_read": 0,
+            "hosts": self.crawl.get("hosts", []),
+            "risk": sev.worst([f["severity"] for f in self.findings])
+                    if self.findings else "info",
+            "generated_at": time.time(),
+            "llm_error": None,
+            "mode": "quick",
+            "verdict": f"{len(self.findings)} issues found by the fast pass. "
+                       f"The model has not read the code yet.",
+            "summary": (
+                f"Mirrored {self.crawl.get('file_count', 0)} files and ran the "
+                f"rule engine, header checks and exposed-path probes over them. "
+                f"{self.files_queued} files are queued for line-by-line review — "
+                f"ask me to read them, or just start asking questions."
+            ),
+            "themes": [],
+            "priorities": _fallback_priorities(top),
+            "coverage": {
+                "ai_model": self.llm.model,
+                "ai_available": True,
+                "files_total": self.files_considered,
+                "files_vendor_skipped": len(self.files_vendor_skipped),
+                "files_queued_for_ai": self.files_queued,
+                "files_ai_reviewed": 0,
+                "chunks_sent_to_ai": 0,
+                "chunks_ai_answered": 0,
+                "findings_from_ai": 0,
+                "findings_from_rules": sum(
+                    1 for f in self.findings
+                    if str(f.get("source", "")).startswith("rule:")),
+                "findings_from_headers_and_probes": sum(
+                    1 for f in self.findings
+                    if not str(f.get("source", "")).startswith("rule:")),
+            },
+        }
 
     # ------------------------------------------------------------------ pass 1
     def _deterministic_pass(self) -> list[dict]:

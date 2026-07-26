@@ -176,7 +176,8 @@ class SiteDownloader:
         while True:
             url, depth = await self.frontier.get()
             try:
-                if self._pages_done >= settings.crawl_max_pages:
+                cap = settings.crawl_max_pages
+                if cap > 0 and self._pages_done >= cap:
                     continue
                 await self._handle_page(url, depth)
             except Exception as exc:  # a bad page must not kill the crawl
@@ -218,7 +219,8 @@ class SiteDownloader:
         await self._flush_announcements()
 
         if done % 5 == 0:
-            pct = 0.05 + 0.25 * min(1.0, done / max(1, settings.crawl_max_pages))
+            denom = settings.crawl_max_pages if settings.crawl_max_pages > 0 else 500
+            pct = 0.05 + 0.25 * min(1.0, done / max(1, denom))
             await self._emit("fetching", pct, f"Crawled {done} pages · {url}")
 
     # ------------------------------------------------------------------ assets
@@ -240,7 +242,8 @@ class SiteDownloader:
             await self._drain_assets()
 
     async def _handle_asset(self, url: str, sem: asyncio.Semaphore) -> None:
-        if self._assets_done >= settings.crawl_max_assets:
+        cap = settings.crawl_max_assets
+        if cap > 0 and self._assets_done >= cap:
             return
         async with sem:
             try:
@@ -272,7 +275,9 @@ class SiteDownloader:
                 await self._flush_announcements()
 
                 if done % 25 == 0:
-                    pct = 0.30 + 0.12 * min(1.0, done / max(1, settings.crawl_max_assets))
+                    adenom = (settings.crawl_max_assets
+                              if settings.crawl_max_assets > 0 else 2000)
+                    pct = 0.30 + 0.12 * min(1.0, done / max(1, adenom))
                     await self._emit("fetching", pct, f"Downloaded {done} assets")
             except Exception as exc:
                 self.result.errors.append(f"{url}: {exc}")
@@ -319,7 +324,8 @@ class SiteDownloader:
         self.result.hosts |= {h for h in found.hosts if h}
         self.result.endpoints |= found.endpoints
 
-        if depth <= settings.crawl_max_depth:
+        # Depth 0 means unlimited: follow routes as far as they go.
+        if settings.crawl_max_depth <= 0 or depth <= settings.crawl_max_depth:
             for link in found.links:
                 if link in self.seen or not self._in_scope(link):
                     continue

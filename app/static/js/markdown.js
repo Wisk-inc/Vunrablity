@@ -38,7 +38,7 @@
         i++;
         while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
         i++;
-        out.push(`<pre><code data-lang="${lang}">${body.join("\n")}</code></pre>`);
+        out.push(renderCode(body.join("\n"), lang));
         continue;
       }
 
@@ -109,6 +109,27 @@
     }
 
     return out.join("");
+  }
+
+  /* Fenced code blocks get real syntax highlighting.
+
+     `render()` escapes the whole source up front, so the body arriving here is
+     already HTML-escaped. The highlighter escapes too — so unescape first, or
+     everything comes out as &amp;lt; soup. */
+  const unesc = (s) =>
+    String(s)
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&");
+
+  function renderCode(body, lang) {
+    const raw = unesc(body);
+    if (global.hl) {
+      const language = lang || global.hl.guessLanguage("") || "text";
+      return `<pre><code data-lang="${lang}">` +
+             global.hl.highlightCode(raw, language) + `</code></pre>`;
+    }
+    return `<pre><code data-lang="${lang}">${body}</code></pre>`;
   }
 
   function cells(row) {

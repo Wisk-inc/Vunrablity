@@ -64,7 +64,7 @@ async def run_scan(scan_id: str, url: str) -> None:
         }
 
         db.update_scan(scan_id, status="complete", stage="done", progress=1.0,
-                       message="Audit complete", summary=json.dumps(report))
+                       message="Ready", summary=json.dumps(report))
         (dest / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
         db.add_message(
@@ -86,8 +86,9 @@ async def run_scan(scan_id: str, url: str) -> None:
 def _opening_message(report: dict) -> str:
     counts = report.get("counts", {})
     risk = report.get("risk", "info")
+    quick = report.get("mode") == "quick"
     lines = [
-        f"**Audit complete — {report.get('url')}**",
+        f"**{'Mirror ready' if quick else 'Audit complete'} — {report.get('url')}**",
         "",
         report.get("verdict") or "",
         "",
@@ -109,8 +110,26 @@ def _opening_message(report: dict) -> str:
             lines.append(f"{p.get('order', '•')}. **{p.get('action')}** — "
                          f"{p.get('why', '')} {f'`{files}`' if files else ''}")
 
-    lines += ["", f"Overall risk: **{labels.get(risk, risk)}**.",
-              "", "Ask me anything about these findings. I can also open the "
-              "sandbox and check something for you — try *\"prove the XSS in "
-              "the search page\"*."]
+    lines += ["", f"Overall risk so far: **{labels.get(risk, risk)}**."]
+
+    if quick:
+        cov = report.get("coverage", {})
+        lines += [
+            "",
+            f"That was the fast pass — rules, headers and exposed paths over "
+            f"the whole mirror. **{cov.get('files_queued_for_ai', 0)} files are "
+            f"indexed but not yet read line by line.**",
+            "",
+            "You're not waiting on anything. Ask me questions now, or:",
+            "",
+            "- **\"read everything\"** — I'll read every file with the model in "
+            "the background and keep talking to you while it runs",
+            "- **\"read the JavaScript\"** — narrow it to what you care about",
+            "- **\"serve the site\"** — run it so you can click through it",
+            "- **\"add a login page\"** / **\"fix that XSS\"** — I can write and "
+            "edit code here too",
+        ]
+    else:
+        lines += ["", "Ask me anything about these findings, or tell me to "
+                  "prove, fix, or rebuild something."]
     return "\n".join(l for l in lines if l is not None)

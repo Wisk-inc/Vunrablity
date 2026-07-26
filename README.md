@@ -6,8 +6,12 @@ line, and then lets you talk to that model about what it found — including
 letting it run commands in the sandbox to prove or disprove its own claims.
 
 ```
-  URL  ──▶  mirror  ──▶  organise  ──▶  read every line  ──▶  chat + agent
-           (crawler)     (inventory)    (Ollama + rules)      (sandbox)
+  URL ──▶ mirror everything ──▶ fast rule pass ──▶ chat immediately
+          (seconds, no model)      (findings on the board)
+                                          │
+                                          └──▶ "read everything" ──▶ deep read
+                                               (background, concurrent, while
+                                                you keep talking to the agent)
 ```
 
 ![Landing](docs/screenshot-landing.png)
@@ -36,19 +40,24 @@ finding in its own right.
 recorded as a finding on the spot. GET requests only — it asks politely and
 notes what the server volunteers.
 
-**4. Reads every line.** A local Ollama model walks each file in overlapping
-windows of ~120 lines, each labelled with absolute line numbers. It carries a
-memory across the whole scan — facts it established, files it summarised,
-findings it already recorded — so file 200 is judged in the context of what it
-learned in file 3. A deterministic rule engine (60+ patterns) runs first and
-hands the model its hits as hints to confirm, downgrade, or reject.
+**4. Gets out of your way first.** A scan finishes in seconds: it mirrors
+everything and runs the rule engine, header checks and exposed-path probes over
+the whole tree. You are talking to the agent almost immediately, with real
+findings already on the board — no waiting on a model to read a thousand files.
 
-**5. Grades and explains.** Every finding gets a severity — *Critical*,
+**5. Reads every line when you ask.** Say *"read everything"* and the model
+walks each file in overlapping ~120-line windows, several files at a time, in
+the background. The conversation stays fully usable while it runs and findings
+appear as they land. It carries memory across the whole pass, so file 200 is
+judged in the context of what it learned in file 3, and rule hits are handed to
+it as hints to confirm, downgrade or reject.
+
+**6. Grades and explains.** Every finding gets a severity — *Critical*,
 *Dangerous*, *Moderate*, *Small*, *Informational* — plus a confidence score, a
 CWE, the exact offending line, why it is exploitable **here**, and the specific
 change to make.
 
-**6. Runs your code, for real.** The mirror lands in a sandbox — a Docker
+**7. Runs your code, for real.** The mirror lands in a sandbox — a Docker
 container via [llm-sandbox](https://github.com/vndee/llm-sandbox) where a
 daemon exists, otherwise a local workspace so it still works on Replit. The
 agent writes files, creates directories, installs packages, clones from GitHub,
@@ -56,7 +65,7 @@ runs what it wrote, and serves the site so you can click through it — the shap
 of capability [gpt-engineer](https://github.com/AntonOsika/gpt-engineer) and
 Replit's agent have, pointed at auditing.
 
-**7. Then you chat — no modes.** Ask a question and you get an answer. Say
+**8. Then you chat — no modes.** Ask a question and you get an answer. Say
 "write a script that scans every JS file for secrets, then run it" and it does
 exactly that, streaming the file into existence character by character, running
 it, and telling you what came back. The model decides whether to talk or act;
@@ -114,17 +123,20 @@ Everything lives in `.env` (see `.env.example`). The values worth knowing:
 | --- | --- | --- |
 | `OLLAMA_MODEL` | `qwen2.5-coder:3b` | The model that reads your code |
 | `OLLAMA_NUM_CTX` | `8192` | Context window; bigger = more lines per pass |
-| `CRAWL_MAX_PAGES` | `5000` | Page budget for the crawl |
+| `CRAWL_MAX_PAGES` | `5000` | Page budget — **0 means unlimited** |
 | `CRAWL_MAX_ASSETS` | `20000` | Asset budget |
 | `CRAWL_EXTERNAL_ASSETS` | `true` | Also mirror CDN/third-party bundles |
+| `CRAWL_MAX_DEPTH` | `12` | Route depth — **0 means unlimited** |
 | `CRAWL_FOLLOW_SUBDOMAINS` | `true` | Follow `*.yourdomain.com` |
-| `CRAWL_RESPECT_ROBOTS` | `true` | Honour `robots.txt` |
+| `CRAWL_RESPECT_ROBOTS` | `false` | Honour `robots.txt` |
 | `ANALYSIS_CHUNK_LINES` | `120` | Lines per reading window |
-| `ANALYSIS_MAX_FILES` | `400` | Cap on files sent to the model |
+| `ANALYSIS_MAX_FILES` | `2000` | Cap on files sent to the model |
+| `ANALYSIS_CONCURRENCY` | `6` | Files read in parallel during a deep read |
+| `ANALYSIS_DEEP_ON_SCAN` | `false` | Read every line at scan time (slow) |
 | `SANDBOX_BACKEND` | `auto` | `auto` \| `docker` \| `local` \| `llm-sandbox` \| `none` |
 | `SANDBOX_IMAGE` | `python:3.11-slim` | Container base image |
 | `SANDBOX_NETWORK` | `bridge` | The agent needs it to clone from GitHub |
-| `AGENT_MAX_STEPS` | `25` | Tool calls per agent investigation |
+| `AGENT_MAX_STEPS` | `40` | Tool calls per agent investigation |
 
 A bigger model reads better. `qwen2.5-coder:7b` or `14b` are noticeably
 sharper on subtle logic bugs if you have the memory; `3b` is the default
@@ -160,6 +172,8 @@ Written as fenced actions in its reply, executed the moment each block closes:
 | | |
 | --- | --- |
 | `write` `append` `read` | files, in any format, creating directories as needed |
+| `edit` | patch part of a file — old text `===` new text |
+| `audit` | read every mirrored file with the model, in the background |
 | `mkdir` `move` `copy` `delete` | reorganise the tree |
 | `list` `tree` `grep` | find things |
 | `run` `python` `node` | execute — the body is the command or the code |
@@ -196,7 +210,7 @@ app/
                 js/chat.js        streaming UI, file viewer/editor, preview
   main.py       HTTP + WebSocket surface
   pipeline.py   download → index → audit → report
-tests/          63 tests, including a deliberately-broken fixture site and a
+tests/          66 tests, including a deliberately-broken fixture site and a
                 real-Ollama integration test that skips without one
 ```
 
@@ -205,7 +219,7 @@ tests/          63 tests, including a deliberately-broken fixture site and a
 ## Tests
 
 ```bash
-pytest                       # 63 tests, ~7 seconds
+pytest                       # 66 tests, ~9 seconds
 ```
 
 `tests/fixtures/site/` is a small website with real planted bugs — a leaked

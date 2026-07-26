@@ -270,7 +270,7 @@ async def test_full_audit_finds_real_problems(site_server, scan_dir, monkeypatch
     db.add_files(scan_id, crawl.files)
 
     llm = ScriptedLLM()
-    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=llm).run()
+    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=llm).run(deep=True)
 
     findings = db.list_findings(scan_id)
     titles = " | ".join(f["title"] for f in findings)
@@ -342,7 +342,7 @@ async def test_audit_still_works_without_a_model(site_server, scan_dir, monkeypa
     crawl = await SiteDownloader(site_server, dest).run()
     db.add_files(scan_id, crawl.files)
 
-    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=DeadLLM()).run()
+    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=DeadLLM()).run(deep=True)
 
     assert report["total"] > 0
     assert report["llm_error"]
@@ -388,7 +388,7 @@ async def test_coverage_never_credits_a_file_the_model_failed_to_answer(
     db.add_files(scan_id, crawl.files)
 
     llm = GarbageLLM()
-    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=llm).run()
+    report = await Analyzer(scan_id, dest, crawl.as_dict(), llm=llm).run(deep=True)
 
     assert llm.calls > 0, "the model must actually have been sent chunks"
 

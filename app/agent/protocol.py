@@ -40,12 +40,13 @@ FENCE = "```"
 OPEN_RE = re.compile(r"^```tool:([a-zA-Z_][\w-]*)[ \t]*(.*)$")
 
 # Tools whose body is the payload (a file's contents, a shell script, code).
-BODY_TOOLS = {"run", "python", "write", "append", "node", "bash", "sh"}
+BODY_TOOLS = {"run", "python", "write", "append", "edit", "node", "bash", "sh"}
 
 # Everything the model is allowed to open a fence with.
 KNOWN_TOOLS = BODY_TOOLS | {
     "read", "list", "tree", "grep", "mkdir", "move", "copy", "delete",
     "install", "serve", "stop", "logs", "finding", "remember", "fetch",
+    "audit",
 }
 
 

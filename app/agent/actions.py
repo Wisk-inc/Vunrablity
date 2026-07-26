@@ -236,6 +236,70 @@ class ActionRunner:
         return self._ok(self.sandbox.service_log(name, _int(args.get("tail"), 120)),
                         action="logs")
 
+    # ------------------------------------------------------------------ editing
+    def _do_edit(self, args: dict, body: str) -> dict:
+        """Change part of a file instead of rewriting the whole thing.
+
+        Body is `<<<OLD ... === ... >>>` — everything before the `===` marker is
+        matched literally and replaced by what follows. Rewriting a whole file
+        to change three lines is how a small model destroys the other 300.
+        """
+        path = args.get("path")
+        if not path:
+            return self._err('edit needs path="..."')
+
+        current = self.sandbox.read_file(path, 1, 1_000_000)
+        if current.strip().endswith("no such file"):
+            return self._err(f"{path} does not exist — use write to create it")
+
+        if "===" not in body:
+            return self._err(
+                "edit body must be:  <old text>\n===\n<new text>")
+        old, _, new = body.partition("\n===\n")
+        old = old.strip("\n")
+        new = new.strip("\n")
+
+        if old and old not in current:
+            return self._err(
+                f"that exact text is not in {path}. Read it first, and copy the "
+                f"lines you want to change verbatim.")
+
+        updated = current.replace(old, new, 1) if old else current + "\n" + new
+        result = self.sandbox.write_file(path, updated)
+        if not result.ok:
+            return self._err(result.output, path=path)
+        self.touched.append(path)
+        delta = updated.count("\n") - current.count("\n")
+        return self._ok(
+            f"edited {path} ({delta:+d} lines)\n\n--- was ---\n{old[:400]}"
+            f"\n--- now ---\n{new[:400]}",
+            path=path, action="edit")
+
+    # ------------------------------------------------------------------ deep read
+    def _do_audit(self, args: dict, body: str) -> dict:
+        """Kick off (or report on) the model reading every mirrored file.
+
+        This is the expensive pass, so it is never implicit — it happens when
+        the user asks for it, and it runs in the background so the conversation
+        stays usable while it works.
+        """
+        from ..deepread import status, start
+
+        want = (args.get("_positional") or body or "").strip().lower()
+        if want in ("status", "progress"):
+            return self._ok(_format_status(status(self.scan_id)), action="audit")
+
+        state = start(self.scan_id, self.root,
+                      only=args.get("glob") or args.get("pattern"))
+        if state.get("already_running"):
+            return self._ok("A full read is already running.\n"
+                            + _format_status(status(self.scan_id)), action="audit")
+        return self._ok(
+            f"Reading all {state['queued']} files with the model, "
+            f"{state['concurrency']} at a time, in the background.\n"
+            f"Ask me anything meanwhile — I'll fold findings in as they land.",
+            action="audit", queued=state["queued"])
+
     # ------------------------------------------------------------------ audit
     def _do_finding(self, args: dict, body: str) -> dict:
         title = args.get("title") or body.strip().split("\n")[0][:200]
@@ -270,6 +334,16 @@ class ActionRunner:
             return self._err("remember needs something to remember")
         self.memory.note(fact)
         return self._ok(f"remembered: {fact[:200]}", action="remember")
+
+
+def _format_status(state: dict) -> str:
+    if not state or state.get("state") == "idle":
+        return "No full read has been started yet."
+    if state["state"] == "running":
+        return (f"Reading: {state['done']}/{state['total']} files · "
+                f"{state['findings']} findings so far.")
+    return (f"Finished: read {state['done']}/{state['total']} files, "
+            f"{state['findings']} findings.")
 
 
 def _clip(text: str) -> str:

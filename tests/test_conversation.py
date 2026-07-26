@@ -195,3 +195,71 @@ async def test_model_outage_mid_turn_is_reported_not_raised(workspace):
 
     result, _ = await run(scan_id, root, Dead())
     assert "lost the model" in result["answer"]
+
+
+# --------------------------------------------------------------------------- editing
+@pytest.mark.asyncio
+async def test_edit_changes_only_the_matched_region(workspace):
+    """Rewriting a whole file to change three lines is how a small model
+    destroys the other three hundred — edit patches in place."""
+    scan_id, root = workspace
+    llm = Scripted(
+        '```tool:edit path="site/app.js"\n'
+        'function render(x) { el.innerHTML = x; }\n'
+        '===\n'
+        'function render(x) { el.textContent = x; }\n'
+        '```\n',
+        'Patched the sink.',
+    )
+    result, events = await run(scan_id, root, llm, "fix the xss")
+
+    assert result["actions"] == 1
+    assert [p for k, p in events if k == "action_result"][0]["ok"]
+
+    after = (root / "workspace" / "site" / "app.js").read_text()
+    assert "textContent" in after
+    assert "innerHTML" not in after
+    # the rest of the file survived
+    assert "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" in after
+
+
+@pytest.mark.asyncio
+async def test_edit_refuses_when_the_old_text_is_not_there(workspace):
+    """Silently appending — or worse, replacing the wrong thing — would be
+    much harder to notice than an error."""
+    scan_id, root = workspace
+    llm = Scripted(
+        '```tool:edit path="site/app.js"\n'
+        'this text does not exist in the file\n'
+        '===\n'
+        'replacement\n'
+        '```\n',
+        'Could not apply it.',
+    )
+    _, events = await run(scan_id, root, llm)
+    result = [p for k, p in events if k == "action_result"][0]
+    assert not result["ok"]
+    assert "not in" in result["observation"]
+
+    unchanged = (root / "workspace" / "site" / "app.js").read_text()
+    assert "innerHTML" in unchanged
+
+
+@pytest.mark.asyncio
+async def test_the_agent_can_build_something_new(workspace):
+    """Replit-shaped: ask for a feature, get files written and run."""
+    scan_id, root = workspace
+    llm = Scripted(
+        'Adding a contact page.\n'
+        '```tool:write path="site/contact.html"\n'
+        '<!doctype html><title>Contact</title><h1>Contact us</h1>\n'
+        '```\n',
+        '```tool:run\nls site\n```\n',
+        'Added `site/contact.html`.',
+    )
+    result, events = await run(scan_id, root, llm, "add a contact page")
+
+    assert result["actions"] == 2
+    assert (root / "workspace" / "site" / "contact.html").is_file()
+    listing = [p for k, p in events if k == "action_result"][1]["observation"]
+    assert "contact.html" in listing
