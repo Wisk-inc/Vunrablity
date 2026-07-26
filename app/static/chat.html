@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vunrablity — audit</title>
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◍</text></svg>">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5L4 12z"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z"/><path d="M14 3v5h5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></symbol>
+    <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M4 20h16"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5"/><path d="M11 6l-6 6 6 6"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></symbol>
+    <symbol id="i-loop" viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></symbol>
+  </defs>
+</svg>
+
+<div class="shell">
+  <!-- ------------------------------------------------------------ sidebar -->
+  <aside class="side" id="side">
+    <div class="side-head">
+      <div class="row">
+        <a href="/" class="btn btn-icon" title="New scan">
+          <svg class="icon"><use href="#i-back"/></svg>
+        </a>
+        <svg class="icon"><use href="#i-shield"/></svg>
+        <h1>Vunrablity</h1>
+      </div>
+      <div class="target" id="sideTarget">loading…</div>
+    </div>
+
+    <div class="verdict" id="verdictBox" hidden>
+      <div class="risk">
+        <span class="sev" id="riskChip">—</span>
+        <span class="tiny dim" id="filesRead"></span>
+      </div>
+      <p id="verdictText"></p>
+    </div>
+
+    <div class="counts" id="counts"></div>
+
+    <div class="findings" id="findings">
+      <div class="empty">Loading findings…</div>
+    </div>
+
+    <div class="side-foot">
+      <button class="btn" id="termBtn">
+        <svg class="icon"><use href="#i-terminal"/></svg> Sandbox
+      </button>
+      <a class="btn" id="reportBtn" download>
+        <svg class="icon"><use href="#i-dl"/></svg> Report
+      </a>
+      <button class="btn" id="filesBtn">
+        <svg class="icon"><use href="#i-file"/></svg> Files
+      </button>
+    </div>
+  </aside>
+
+  <!-- ------------------------------------------------------------ main -->
+  <main class="main">
+    <header class="main-head">
+      <div class="who">
+        <svg class="icon icon-lg"><use href="#i-shield"/></svg>
+        <div>
+          <h2>Security review</h2>
+          <div class="sub" id="headSub">—</div>
+        </div>
+      </div>
+      <div class="head-actions">
+        <div class="toggle" id="modeToggle" title="Answer from the audit, or send the agent into the sandbox">
+          <button data-mode="auto" class="on">Auto</button>
+          <button data-mode="answer">Explain</button>
+          <button data-mode="agent">Agent</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="stream" id="stream">
+      <div class="stream-inner" id="streamInner"></div>
+    </div>
+
+    <div class="composer">
+      <div class="composer-inner">
+        <div class="chips" id="chips">
+          <button class="chip">What's the single most dangerous issue here?</button>
+          <button class="chip">Show me the exact fix for the critical findings</button>
+          <button class="chip">Are any of these actually exploitable? Verify in the sandbox.</button>
+          <button class="chip">Grep the mirror for hard-coded credentials</button>
+        </div>
+        <div class="composer-box glass">
+          <textarea id="input" rows="1" placeholder="Ask about a finding, or tell the agent what to check…"></textarea>
+          <button class="btn btn-primary btn-icon" id="sendBtn" title="Send">
+            <svg class="icon"><use href="#i-send"/></svg>
+          </button>
+        </div>
+        <div class="foot">
+          <span><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>
+          <span id="modeHint">Auto — the agent takes over when you ask it to do something</span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ------------------------------------------------------------ drawer -->
+<div class="backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div>
+      <h3 id="drawerTitle">—</h3>
+      <div class="path mono" id="drawerPath"></div>
+    </div>
+    <button class="btn btn-icon" id="drawerClose">
+      <svg class="icon"><use href="#i-x"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<script src="/static/js/markdown.js"></script>
+<script src="/static/js/chat.js"></script>
+</body>
+</html>

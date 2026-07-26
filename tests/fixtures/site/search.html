@@ -1,0 +1,10 @@
+<!doctype html>
+<html><head><title>Search</title></head><body>
+<div id="results"></div>
+<script>
+  const term = new URLSearchParams(location.search).get("q");
+  document.write("<h2>You searched for " + term + "</h2>");
+  document.cookie = "last_search=" + term;
+</script>
+<a href="/about.html">about</a>
+</body></html>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Acme Widgets — deliberately broken test site</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js"></script>
+</head>
+<body>
+  <h1>Acme Widgets</h1>
+
+  <nav>
+    <a href="/about.html">About</a>
+    <a href="/login.html">Sign in</a>
+    <a href="/search.html">Search</a>
+  </nav>
+
+  <form method="POST" action="/api/subscribe">
+    <input type="email" name="email" placeholder="you@example.com">
+    <button type="submit">Subscribe</button>
+  </form>
+
+  <script>
+    // inline script: reads the query string straight into the DOM
+    var q = new URLSearchParams(location.search).get("welcome");
+    document.getElementById && (document.body.innerHTML += "<p>" + q + "</p>");
+    var ADMIN_TOKEN = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  </script>
+</body>
+</html>
